@@ -1,0 +1,12 @@
+.DS_Store
+*.xcuserstate
+build/
+releases/
+.claude/
+coding-plans/
+xcuserdata/
+worker/node_modules/
+worker/.dev.vars
+# internal build log — stays on disk, out of the public repo
+AGENTS.md
+CLAUDE.md
