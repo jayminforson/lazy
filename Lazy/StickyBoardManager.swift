@@ -441,19 +441,36 @@ final class StickyBoardManager: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
-    /// board_items() port: open todos, then reminders not linked to a todo,
+    /// board_items() port with the M6.11 change: mail cards first (newest
+    /// received), then open todos, then manual reminders not linked to a todo,
     /// then this session's completed items (crossed), sliced per board.
     func reload() {
         var merged: [StickyItem] = []
         var seenReminderIDs: Set<Int64> = []
         var liveKeys: Set<String> = []
 
-        for todo in mailManager.boardTodos() {
-            merged.append(StickyItem(kind: .todo, rowID: todo.id, title: todo.title, note: todo.details ?? "", dueAt: todo.dueAt, done: false))
+        // Todos are read first so a reminder linked to one is known to be a
+        // duplicate before ANY group is appended — M6.11 reorders the groups
+        // but must keep Lazy's "one card per reminder" dedupe intact.
+        let todos = mailManager.boardTodos()
+        for todo in todos {
             liveKeys.insert("todo:\(todo.id)")
             if let reminderID = todo.reminderID {
                 seenReminderIDs.insert(reminderID)
             }
+        }
+
+        // M6.11 top group: mail cards, newest-received first (user decision —
+        // Lazy led with due-first todos, which buried a fresh school email
+        // below every manual item and sorted it by meeting time instead of
+        // arrival).
+        for reminder in mailManager.boardMailReminders() where !seenReminderIDs.contains(reminder.id) {
+            merged.append(StickyItem(kind: .reminder, rowID: reminder.id, title: reminder.title, note: reminder.note ?? "", dueAt: reminder.dueAt, done: false))
+            liveKeys.insert("reminder:\(reminder.id)")
+        }
+        // Lazy's original order stands for everything a human captured.
+        for todo in todos {
+            merged.append(StickyItem(kind: .todo, rowID: todo.id, title: todo.title, note: todo.details ?? "", dueAt: todo.dueAt, done: false))
         }
         for reminder in mailManager.boardReminders() where !seenReminderIDs.contains(reminder.id) {
             merged.append(StickyItem(kind: .reminder, rowID: reminder.id, title: reminder.title, note: reminder.note ?? "", dueAt: reminder.dueAt, done: false))

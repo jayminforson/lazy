@@ -182,12 +182,23 @@ final class MailManager: ObservableObject {
         let isBackfill = store.account(for: provider)?.lastSyncAt == nil
         let state = store.syncState(for: provider)
         var messageIDs: [String] = []
-        var nextCursor = state.cursor
+        // Normalize a NULL *or* blank cursor to nil: `nextCursor == nil` is
+        // what triggers the seeding listing below, so a blank cursor must not
+        // slip past it into a do-nothing sync that still reports success.
+        var nextCursor: String? = (state.cursor?.isEmpty ?? true) ? nil : state.cursor
 
         switch provider {
         case .gmail:
             if let cursor = state.cursor, !cursor.isEmpty {
                 let history = await gmail.historyChanges(accessToken: tokens.accessToken, startHistoryID: cursor)
+                if history.failed {
+                    // M6.10: a failed history call is NOT "no changes" — record
+                    // a failed poll (→ backoff + last-error chip) and keep the
+                    // cursor so the next pass retries the same window instead
+                    // of silently skipping mail.
+                    noteSyncFailure(provider, "Gmail sync failed — will retry")
+                    return
+                }
                 if history.cursorTooOld {
                     nextCursor = nil  // fall through to a fresh listing below
                 } else {
@@ -202,8 +213,18 @@ final class MailManager: ObservableObject {
                     byAdding: .day, value: -Self.initialLookbackDays, to: Date()
                 ) ?? Date().addingTimeInterval(-7 * 86_400)
                 let listing = await gmail.recentListing(accessToken: tokens.accessToken, since: lookbackDate)
+                if listing.failed {
+                    // M6.10: before this, an errored listing looked like a
+                    // successful empty sync — mail stopped arriving while
+                    // Settings kept showing "synced".
+                    noteSyncFailure(provider, "Gmail listing failed — will retry")
+                    return
+                }
                 messageIDs = listing.messageIDs
                 if let historyID = listing.historyID {
+                    if state.cursor?.isEmpty ?? true {
+                        print("📧 Mail(\(provider.rawValue)): cursor seeded — incremental sync from now on")
+                    }
                     nextCursor = historyID
                 }
             }
@@ -218,8 +239,13 @@ final class MailManager: ObservableObject {
         messageIDs = Array(messageIDs.prefix(Self.maxNewMessagesPerSync))
 
         var newCount = 0
+        var unfetchedIDs: [String] = []
         for messageID in messageIDs {
             if Task.isCancelled { return }
+            // M6.10: skip ids already stored BEFORE spending an API call on
+            // them — the old loop re-fetched up to 60 known messages every
+            // 90 s, exhausting the free quota (which then failed silently).
+            if store.messageExists(provider: provider, providerID: messageID) { continue }
             let message: MailStoreMessage?
             switch provider {
             case .gmail:
@@ -230,6 +256,34 @@ final class MailManager: ObservableObject {
             if let message, store.insertMessageIfNew(message) {
                 newCount += 1
                 await analyzeNewMessage(message, notifyAllowed: !isBackfill)
+            } else if message == nil {
+                unfetchedIDs.append(messageID)
+            }
+        }
+
+        // M6.10: one bounded retry for ids whose fetch failed. The cursor is
+        // written after this pass, so a transient blip that dropped a message
+        // here would otherwise lose it forever (the school email that never
+        // shows up). A still-failing id is logged by authorizedGet and left
+        // to the next listing — we never stall the cursor on it, because a
+        // permanently-gone message would wedge sync permanently.
+        if !unfetchedIDs.isEmpty, !Task.isCancelled {
+            print("📧 Mail(\(provider.rawValue)): retrying \(unfetchedIDs.count) failed fetch(es)")
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            for messageID in unfetchedIDs {
+                if Task.isCancelled { break }
+                if store.messageExists(provider: provider, providerID: messageID) { continue }
+                let message: MailStoreMessage?
+                switch provider {
+                case .gmail:
+                    message = await gmail.fetchMessage(accessToken: tokens.accessToken, id: messageID)
+                case .outlook:
+                    message = await outlook.fetchMessage(accessToken: tokens.accessToken, id: messageID)
+                }
+                if let message, store.insertMessageIfNew(message) {
+                    newCount += 1
+                    await analyzeNewMessage(message, notifyAllowed: !isBackfill)
+                }
             }
         }
 
@@ -343,7 +397,8 @@ final class MailManager: ObservableObject {
             title: "\(tag) \(title)",
             note: parts.joined(separator: "\n"),
             dueAt: classification.meetingStart,
-            dedupeKey: "mail:\(message.provider.rawValue):\(message.providerID)"
+            dedupeKey: "mail:\(message.provider.rawValue):\(message.providerID)",
+            receivedAt: message.receivedAt
         )
         let dueLine = classification.meetingStart
             .map { " due \($0.formatted(date: .omitted, time: .shortened))" } ?? ""
@@ -366,6 +421,11 @@ final class MailManager: ObservableObject {
 
     func boardReminders() -> [MailStore.BoardReminderRow] {
         store.listBoardReminders()
+    }
+
+    /// M6.11: mail cards, newest-received first (the board's top group).
+    func boardMailReminders() -> [MailStore.BoardReminderRow] {
+        store.listBoardMailReminders()
     }
 
     func setBoardItemDone(kind: String, id: Int64, done: Bool) {
@@ -600,6 +660,16 @@ final class MailManager: ObservableObject {
     private func noteLastError(_ provider: MailProvider, _ text: String) {
         print("📧 Mail(\(provider.rawValue)): ⚠️ \(text)")
         lastErrors[provider] = text
+    }
+
+    /// M6.10: a real sync failure — surface it (error chip + console), count
+    /// it for backoff, and refresh the Settings card. Without this the old
+    /// code recorded errored listings as successes, so mail silently stopped
+    /// arriving while Settings kept showing "synced".
+    private func noteSyncFailure(_ provider: MailProvider, _ text: String) {
+        noteLastError(provider, text)
+        store.recordSyncPoll(provider: provider, succeeded: false)
+        publishState(for: provider)
     }
 
     private func publishState(for provider: MailProvider) {

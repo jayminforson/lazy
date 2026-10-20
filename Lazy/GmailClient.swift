@@ -28,9 +28,24 @@ struct GmailClient {
 
     /// Result of the initial bounded listing: message ids plus the account's
     /// current historyId, which seeds the incremental cursor.
+    /// `failed` distinguishes "no new mail" from "the request failed" —
+    /// before M6.10 the caller recorded both as a successful empty sync,
+    /// which silently hid rate-limit/HTTP errors (mail stopped arriving
+    /// while Settings still showed "synced").
     struct RecentListing {
         let messageIDs: [String]
         let historyID: String?
+        let failed: Bool
+    }
+
+    /// Gmail serializes `historyId` as a JSON **number** (int64), not a
+    /// string — `as? String` always returned nil, so the incremental cursor
+    /// was never seeded and every 90 s poll re-listed 7 days of mail and
+    /// re-fetched up to 60 known messages (M6.10 root cause). Accept both.
+    static func historyIDString(_ json: [String: Any]) -> String? {
+        if let string = json["historyId"] as? String, !string.isEmpty { return string }
+        if let number = json["historyId"] as? NSNumber { return number.stringValue }
+        return nil
     }
 
     /// Message ids received since the given date (initial bounded sync —
@@ -44,13 +59,18 @@ struct GmailClient {
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "maxResults", value: String(maxResults))
         ]
-        guard let url = components.url,
-              let (data, _) = await authorizedGet(url: url, accessToken: accessToken),
+        guard let url = components.url else {
+            return RecentListing(messageIDs: [], historyID: nil, failed: true)
+        }
+        guard let (data, _) = await authorizedGet(url: url, accessToken: accessToken),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return RecentListing(messageIDs: [], historyID: nil) }
+        else { return RecentListing(messageIDs: [], historyID: nil, failed: true) }
         let messages = json["messages"] as? [[String: Any]] ?? []
-        let historyID = json["historyId"] as? String
-        return RecentListing(messageIDs: messages.compactMap { $0["id"] as? String }, historyID: historyID)
+        return RecentListing(
+            messageIDs: messages.compactMap { $0["id"] as? String },
+            historyID: Self.historyIDString(json),
+            failed: false
+        )
     }
 
     // MARK: - Incremental sync
@@ -62,6 +82,10 @@ struct GmailClient {
         /// True when the cursor aged out of Gmail's history window — the
         /// caller must fall back to a fresh recent-listing sync.
         let cursorTooOld: Bool
+        /// True when the request failed (HTTP/network/parse). The cursor is
+        /// left untouched so the next pass retries the same window instead of
+        /// silently skipping mail (M6.10).
+        let failed: Bool
     }
 
     /// Incremental changes since the stored history cursor (Gmail history
@@ -74,17 +98,24 @@ struct GmailClient {
             URLQueryItem(name: "maxResults", value: String(maxResults))
         ]
         guard let url = components.url else {
-            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false)
+            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false, failed: true)
         }
-        guard let (data, response) = await authorizedGet(url: url, accessToken: accessToken) else {
-            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false)
+        guard let (data, response) = await authorizedGet(url: url, accessToken: accessToken, failOnNonSuccess: false) else {
+            // Network failure (a 4xx/5xx would have returned the response) —
+            // keep the cursor, report the failure, back off.
+            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false, failed: true)
         }
-        if let http = response as? HTTPURLResponse, http.statusCode == 404 || http.statusCode == 410 {
-            print("📧 Gmail: history cursor too old (\(http.statusCode)) — full re-listing next")
-            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: true)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if http.statusCode == 404 || http.statusCode == 410 {
+                print("📧 Gmail: history cursor too old (\(http.statusCode)) — full re-listing next")
+                return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: true, failed: false)
+            }
+            // Real error (401/429/5xx) — NOT "no changes". Keep the cursor so
+            // the next pass retries the same window.
+            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false, failed: true)
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false)
+            return HistoryResult(messageIDs: [], nextCursor: nil, cursorTooOld: false, failed: true)
         }
         let historyEntries = json["history"] as? [[String: Any]] ?? []
         var ids: [String] = []
@@ -96,11 +127,12 @@ struct GmailClient {
                 }
             }
         }
-        let nextCursor = (json["historyId"] as? String) ?? startHistoryID
+        let nextCursor = Self.historyIDString(json) ?? startHistoryID
         return HistoryResult(
             messageIDs: Array(Set(ids)).sorted(),
             nextCursor: nextCursor,
-            cursorTooOld: false
+            cursorTooOld: false,
+            failed: false
         )
     }
 
@@ -166,7 +198,12 @@ struct GmailClient {
 
     // MARK: - Private helpers
 
-    private func authorizedGet(url: URL, accessToken: String) async -> (Data, URLResponse)? {
+    /// `failOnNonSuccess: false` returns the response even on 4xx/5xx so the
+    /// caller can inspect the status — `historyChanges` needs to see 404/410
+    /// (cursor aged out → fall back to a fresh listing) instead of having it
+    /// flattened into a generic failure. Defaults to nil-on-error for
+    /// callers that only care about success.
+    private func authorizedGet(url: URL, accessToken: String, failOnNonSuccess: Bool = true) async -> (Data, URLResponse)? {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         do {
@@ -174,7 +211,8 @@ struct GmailClient {
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 let bodyText = String(data: data.prefix(200), encoding: .utf8) ?? ""
                 print("📧 Gmail: GET \(url.path) → \(http.statusCode) — \(bodyText)")
-                return nil
+                if failOnNonSuccess { return nil }
+                return (data, response)
             }
             return (data, response)
         } catch {

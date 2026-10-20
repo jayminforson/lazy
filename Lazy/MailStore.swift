@@ -191,6 +191,23 @@ final class MailStore {
             """)
             exec("UPDATE schema_version SET version = 3;")
         }
+        if currentVersion() < 4 {
+            // v4 — M6.11: mail cards sort newest-received-first at the top of
+            // the board, so `reminder` needs the email's actual arrival time.
+            // `created_at` is the *sync* moment — a backfill of old mail would
+            // share one timestamp and order wrong. Additive ALTER (this table
+            // has rows now, unlike v2/v3 — no DROP/recreate), then backfill the
+            // cards already on the board from the message table via their
+            // mail:<provider>:<provider_id> key so they place correctly at once.
+            exec("ALTER TABLE reminder ADD COLUMN received_at TEXT;")
+            exec("""
+            UPDATE reminder SET received_at = (
+                SELECT m.received_at FROM message m
+                WHERE 'mail:' || m.provider || ':' || m.provider_id = reminder.dedupe_key
+            ) WHERE dedupe_key LIKE 'mail:%' AND received_at IS NULL;
+            """)
+            exec("UPDATE schema_version SET version = 4;")
+        }
     }
 
     private func currentVersion() -> Int {
@@ -307,6 +324,18 @@ final class MailStore {
         bind(Self.isoFormatter.string(from: message.receivedAt), to: statement, at: 8)
         guard sqlite3_step(statement) == SQLITE_DONE else { return false }
         return sqlite3_changes(db) > 0
+    }
+
+    /// M6.10: cheap existence probe so a poll never re-fetches a message it
+    /// already stored (the old loop fetched every id in the listing — up to
+    /// 60 API calls per 90 s pass — which exhausted the free Gmail quota
+    /// and silently stopped mail from arriving).
+    func messageExists(provider: MailProvider, providerID: String) -> Bool {
+        guard let statement = prepare("SELECT 1 FROM message WHERE provider = ? AND provider_id = ? LIMIT 1;") else { return false }
+        defer { sqlite3_finalize(statement) }
+        bind(provider.rawValue, to: statement, at: 1)
+        bind(providerID, to: statement, at: 2)
+        return sqlite3_step(statement) == SQLITE_ROW
     }
 
     func messageCount(for provider: MailProvider) -> Int {
@@ -432,6 +461,9 @@ final class MailStore {
         let note: String?
         let dueAt: Date?
         let state: String
+        /// M6.11: the email's arrival time — set only on mail cards, drives the
+        /// newest-first ordering of the board's top group.
+        let receivedAt: Date?
     }
 
     struct BoardTodoRow {
@@ -460,16 +492,19 @@ final class MailStore {
     }
 
     /// `dedupeKey` (e.g. "mail:gmail:provider-id") makes mail→board inserts
-    /// idempotent across syncs (Lazy's F-09 dedupe).
+    /// idempotent across syncs (Lazy's F-09 dedupe). `receivedAt` (M6.11) is
+    /// the email's arrival time — only mail cards pass it; it defaults to nil
+    /// so chat-captured reminders are unaffected.
     @discardableResult
-    func addReminder(title: String, note: String?, dueAt: Date?, dedupeKey: String?) -> Int64? {
+    func addReminder(title: String, note: String?, dueAt: Date?, dedupeKey: String?, receivedAt: Date? = nil) -> Int64? {
         if let dedupeKey, hasReminder(dedupeKey: dedupeKey) { return nil }
-        guard let statement = prepare("INSERT INTO reminder (title, note, due_at, dedupe_key) VALUES (?, ?, ?, ?);") else { return nil }
+        guard let statement = prepare("INSERT INTO reminder (title, note, due_at, dedupe_key, received_at) VALUES (?, ?, ?, ?, ?);") else { return nil }
         defer { sqlite3_finalize(statement) }
         bind(title, to: statement, at: 1)
         bind(note, to: statement, at: 2)
         bind(dueAt.map { Self.isoFormatter.string(from: $0) }, to: statement, at: 3)
         bind(dedupeKey, to: statement, at: 4)
+        bind(receivedAt.map { Self.isoFormatter.string(from: $0) }, to: statement, at: 5)
         guard sqlite3_step(statement) == SQLITE_DONE else { return nil }
         postBoardChanged()
         return sqlite3_last_insert_rowid(db)
@@ -506,10 +541,13 @@ final class MailStore {
         return rows
     }
 
+    /// Manual reminders only (M6.11): Lazy's exact due-first rule is kept for
+    /// everything a human captured — mail cards moved to their own group.
     func listBoardReminders(limit: Int = 100) -> [BoardReminderRow] {
         guard let statement = prepare("""
-        SELECT id, title, note, due_at, state FROM reminder
+        SELECT id, title, note, due_at, state, received_at FROM reminder
         WHERE state IN ('open', 'snoozed')
+          AND (dedupe_key IS NULL OR dedupe_key NOT LIKE 'mail:%')
         ORDER BY (due_at IS NULL), due_at ASC, id DESC LIMIT ?;
         """) else { return [] }
         defer { sqlite3_finalize(statement) }
@@ -521,7 +559,34 @@ final class MailStore {
                 title: textColumn(statement, 1) ?? "",
                 note: textColumn(statement, 2),
                 dueAt: dateColumn(statement, 3),
-                state: textColumn(statement, 4) ?? "open"
+                state: textColumn(statement, 4) ?? "open",
+                receivedAt: dateColumn(statement, 5)
+            ))
+        }
+        return rows
+    }
+
+    /// M6.11: mail cards form the board's top group, newest-received first —
+    /// user decision, overriding Lazy's due-first rule for mail only. SQLite
+    /// sorts NULLs last under DESC, so a pre-v4 card with no received time
+    /// falls to the bottom of the group (correct: it's the oldest).
+    func listBoardMailReminders(limit: Int = 100) -> [BoardReminderRow] {
+        guard let statement = prepare("""
+        SELECT id, title, note, due_at, state, received_at FROM reminder
+        WHERE state IN ('open', 'snoozed') AND dedupe_key LIKE 'mail:%'
+        ORDER BY received_at DESC, id DESC LIMIT ?;
+        """) else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, Int64(limit))
+        var rows: [BoardReminderRow] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            rows.append(BoardReminderRow(
+                id: sqlite3_column_int64(statement, 0),
+                title: textColumn(statement, 1) ?? "",
+                note: textColumn(statement, 2),
+                dueAt: dateColumn(statement, 3),
+                state: textColumn(statement, 4) ?? "open",
+                receivedAt: dateColumn(statement, 5)
             ))
         }
         return rows
@@ -596,7 +661,8 @@ final class MailStore {
                 title: textColumn(statement, 1) ?? "",
                 note: textColumn(statement, 2),
                 dueAt: dateColumn(statement, 3),
-                state: textColumn(statement, 4) ?? "open"
+                state: textColumn(statement, 4) ?? "open",
+                receivedAt: nil  // firing keys off due_at; arrival time unused here
             ))
         }
         for reminder in claimed {
