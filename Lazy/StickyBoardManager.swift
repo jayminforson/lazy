@@ -195,11 +195,12 @@ final class StickyBoardManager: ObservableObject {
             Task { @MainActor [weak self] in self?.scheduleReload() }
         }
         reload()
-        // Equal-level ordering insurance: Finder re-fronts its desktop
-        // window on a desktop click — at the same layer that could bury the
-        // note behind the wallpaper. Re-front when an app activates; the
-        // LEVEL never changes, so app windows still always win above us
-        // (same pattern as NotchChatManager's window re-fronting).
+        // Ordering insurance (M6.9 note): Finder re-fronts its desktop window
+        // on a desktop click, but the board now sits +3 ABOVE that layer
+        // (-2147483600), so Finder can never bury it — the observer stays as
+        // cheap insurance to re-stack board → overlay → popup after an app
+        // activation; the LEVEL never changes, so app windows still always
+        // win above us (same pattern as NotchChatManager's re-fronting).
         finderObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -342,8 +343,21 @@ final class StickyBoardManager: ObservableObject {
     /// CGWindowLevel.h's CGWindowLevelKey — the CF_ENUM exposes only its
     /// failable raw init to Swift; Apple can only append keys, ordinals
     /// are stable. Probe-verified: -2147483603 vs windows at 0.)
+    ///
+    /// **+3 offset (M6.9):** Finder's desktop-icons window sits at exactly
+    /// the raw desktop-icon level (-2147483603) and re-raises itself on every
+    /// desktop click — same level, so it could order in front of the board and
+    /// swallow its clicks (clicks "acted like empty desktop"; recovery only
+    /// fired on app activation). Probe of the band above it: Finder desktop
+    /// -2147483603, menu underbelly -2147483602, desktop widgets -2147483601,
+    /// then nothing until normal windows at 0. +3 lands at **-2147483600** —
+    /// deterministically above all three (never a tie, ties are where the race
+    /// came from) and still ~2.1 billion below any app window, so the
+    /// never-cover-work invariant holds by arithmetic.
     static var desktopIconLevel: NSWindow.Level {
-        NSWindow.Level(rawValue: Int(CGWindowLevelForKey(CGWindowLevelKey(rawValue: 18)!)))
+        NSWindow.Level(
+            rawValue: Int(CGWindowLevelForKey(CGWindowLevelKey(rawValue: 18)!)) + 3
+        )
     }
 
     // MARK: Panel

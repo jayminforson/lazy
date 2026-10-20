@@ -23,8 +23,10 @@
 //  the Edit dialog (see StickyBoardManager.handleOverlayPress), so rename
 //  stays reachable even though the overlay eats the board's second click.
 //
-//  Layer: the board's desktop-icon level (M6.5b widget rule — the popup
-//  can never cover windows; Lazy's floated over everything). Consequence:
+//  Layer: the board's shared widget level (M6.5b rule + the M6.9 +3 offset —
+//  the popup can never cover windows, and it now also sits above Finder's
+//  desktop window so neither board nor popup can be click-buried; Lazy's
+//  floated over everything). Consequence:
 //  a click on an app window doesn't reach us at this layer, so the popup
 //  outlives it until ✕ or a desktop click — accepted divergence (recorded
 //  in AGENTS.md). Popup geometry is NOT persisted (Lazy's wasn't either).
