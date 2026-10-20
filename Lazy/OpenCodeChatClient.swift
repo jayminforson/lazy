@@ -258,7 +258,7 @@ final class OpenCodeChatClient {
     ) async throws -> AgentRunOutcome {
         try await ensureServerIsRunning()
 
-        let createdSession = try await postJSON(path: "/session", body: ["title": "clicky-agent-run"])
+        let createdSession = try await postJSON(path: "/session", body: ["title": "lazy-agent-run"])
         guard let agentSessionID = createdSession["id"] as? String else {
             throw makeBridgeError(message: "server did not return an agent session ID")
         }
@@ -485,7 +485,7 @@ final class OpenCodeChatClient {
     ) async throws -> String {
         try await ensureServerIsRunning()
 
-        let createdSession = try await postJSON(path: "/session", body: ["title": "clicky-computer-use"])
+        let createdSession = try await postJSON(path: "/session", body: ["title": "lazy-computer-use"])
         guard let computerUseSessionID = createdSession["id"] as? String else {
             throw makeBridgeError(message: "server did not return a computer-use session ID")
         }
@@ -567,7 +567,7 @@ final class OpenCodeChatClient {
     /// path uses; deleted immediately after the request.
     private func writeComputerUseScreenshotToTemporaryFile(imageData: Data) throws -> URL {
         let temporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clicky-brain-images", isDirectory: true)
+            .appendingPathComponent("lazy-brain-images", isDirectory: true)
         try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
         let imageURL = temporaryDirectory.appendingPathComponent("\(UUID().uuidString).jpg")
         try imageData.write(to: imageURL)
@@ -989,7 +989,7 @@ final class OpenCodeChatClient {
     /// kept on disk longer than the request itself).
     private func writeImagesToTemporaryFiles(images: [(data: Data, label: String)]) throws -> [URL] {
         let temporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clicky-brain-images", isDirectory: true)
+            .appendingPathComponent("lazy-brain-images", isDirectory: true)
         try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
 
         return try images.map { image in

@@ -1,5 +1,5 @@
 //
-//  ClickyApp.swift
+//  LazyApp.swift
 //  Clicky
 //
 //  Menu bar-only companion app. No dock icon, no main window — just an
@@ -11,7 +11,7 @@ import ServiceManagement
 import SwiftUI
 
 @main
-struct ClickyApp: App {
+struct LazyApp: App {
     @NSApplicationDelegateAdaptor(CompanionAppDelegate.self) var appDelegate
 
     var body: some Scene {
@@ -34,13 +34,13 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var welcomeTourManager: WelcomeTourManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        print("🎯 Clicky: Starting...")
-        print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
+        print("🎯 Lazy: Starting...")
+        print("🎯 Lazy: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 
-        ClickyAnalytics.configure()
-        ClickyAnalytics.trackAppOpened()
+        LazyAnalytics.configure()
+        LazyAnalytics.trackAppOpened()
 
         menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
 
@@ -95,9 +95,9 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         if loginItemService.status != .enabled {
             do {
                 try loginItemService.register()
-                print("🎯 Clicky: Registered as login item")
+                print("🎯 Lazy: Registered as login item")
             } catch {
-                print("⚠️ Clicky: Failed to register as login item: \(error)")
+                print("⚠️ Lazy: Failed to register as login item: \(error)")
             }
         }
     }

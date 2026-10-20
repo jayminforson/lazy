@@ -64,8 +64,8 @@ extension CompanionManager {
         defer { isAgentRunActive = false }
 
         let agentRunSourceLabel = source == .voice ? "voice" : "typed"
-        ClickyAnalytics.trackAgentRunStarted(source: agentRunSourceLabel)
-        ClickyLatency.mark("agent-run-started")
+        LazyAnalytics.trackAgentRunStarted(source: agentRunSourceLabel)
+        LazyLatency.mark("agent-run-started")
         let agentRunStartDate = Date()
         print("🤖 Agent run started (\(agentRunSourceLabel)): \(goal)")
 
@@ -147,21 +147,21 @@ extension CompanionManager {
             }
             let agentRunDurationMilliseconds = Int(Date().timeIntervalSince(agentRunStartDate) * 1000)
             if agentRunOutcome.failureDescription == nil {
-                ClickyAnalytics.trackAgentRunCompleted(
+                LazyAnalytics.trackAgentRunCompleted(
                     durationMilliseconds: agentRunDurationMilliseconds,
                     toolCallCount: agentRunOutcome.toolCallCount
                 )
             } else {
-                ClickyAnalytics.trackAgentRunAborted(reason: "error")
+                LazyAnalytics.trackAgentRunAborted(reason: "error")
             }
-            ClickyLatency.mark("agent-run-finished")
+            LazyLatency.mark("agent-run-finished")
             print("🤖 Agent run finished: \(agentRunOutcome.toolCallCount) tool call(s), \(agentRunDurationMilliseconds)ms, stoppedEarly=\(agentRunOutcome.didStopEarly)")
             return agentRunOutcome
         } catch is CancellationError {
             // A new interaction interrupted the run (PTT re-press, typed
             // message, Stop button) — the client already aborted it
             // server-side so bash stopped too.
-            ClickyAnalytics.trackAgentRunAborted(reason: "cancelled")
+            LazyAnalytics.trackAgentRunAborted(reason: "cancelled")
             return OpenCodeChatClient.AgentRunOutcome(
                 finalSummaryText: "",
                 toolCallCount: activeAgentRunProgressLines.count,
@@ -170,8 +170,8 @@ extension CompanionManager {
                 failureDescription: nil
             )
         } catch {
-            ClickyAnalytics.trackAgentRunAborted(reason: "error")
-            ClickyAnalytics.trackResponseError(error: "agent: \(error.localizedDescription)")
+            LazyAnalytics.trackAgentRunAborted(reason: "error")
+            LazyAnalytics.trackResponseError(error: "agent: \(error.localizedDescription)")
             recordLastError("agent run failed — \(String(error.localizedDescription.prefix(160)))")
             return OpenCodeChatClient.AgentRunOutcome(
                 finalSummaryText: "",
@@ -418,8 +418,8 @@ extension CompanionManager {
         defer { isAgentRunActive = false }
 
         let computerUseSourceLabel = source == .voice ? "voice" : "typed"
-        ClickyAnalytics.trackComputerUseRunStarted(source: computerUseSourceLabel)
-        ClickyLatency.mark("computer-use-run-started")
+        LazyAnalytics.trackComputerUseRunStarted(source: computerUseSourceLabel)
+        LazyLatency.mark("computer-use-run-started")
         let computerUseRunStartDate = Date()
         print("🖥 Computer-use run started (\(computerUseSourceLabel)): \(goal)")
 
@@ -438,12 +438,12 @@ extension CompanionManager {
         for stepNumber in 1...Self.maximumComputerUseStepCount {
             guard !Task.isCancelled else {
                 outcomeLine = "I stopped the computer-use run — cancelled after \(stepNumber - 1) steps."
-                ClickyAnalytics.trackComputerUseRunAborted(reason: "cancelled")
+                LazyAnalytics.trackComputerUseRunAborted(reason: "cancelled")
                 break
             }
             if Date().timeIntervalSince(computerUseRunStartDate) > Self.maximumComputerUseDurationInSeconds {
                 outcomeLine = "I stopped the computer-use run — it timed out after \(stepNumber - 1) steps."
-                ClickyAnalytics.trackComputerUseRunAborted(reason: "timeout")
+                LazyAnalytics.trackComputerUseRunAborted(reason: "timeout")
                 print("🖥 Computer-use run timed out at step \(stepNumber)")
                 break
             }
@@ -454,16 +454,16 @@ extension CompanionManager {
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
                 guard let capturedCursorScreen = screenCaptures.first(where: { $0.isCursorScreen }) else {
                     outcomeLine = "The computer-use run failed: no screen capture."
-                    ClickyAnalytics.trackComputerUseRunAborted(reason: "error")
+                    LazyAnalytics.trackComputerUseRunAborted(reason: "error")
                     break
                 }
                 cursorScreenCapture = capturedCursorScreen
             } catch {
                 outcomeLine = "The computer-use run failed: \(error.localizedDescription)"
-                ClickyAnalytics.trackComputerUseRunAborted(reason: "error")
+                LazyAnalytics.trackComputerUseRunAborted(reason: "error")
                 break
             }
-            ClickyLatency.mark("computer-use-step-capture")
+            LazyLatency.mark("computer-use-step-capture")
 
             // A3 — did the previous action visibly change the screen?
             // Raw-vs-raw downscale diff; a no-effect step gets the reason
@@ -519,16 +519,16 @@ extension CompanionManager {
                 )
             } catch is CancellationError {
                 outcomeLine = "I stopped the computer-use run — cancelled after \(stepNumber - 1) steps."
-                ClickyAnalytics.trackComputerUseRunAborted(reason: "cancelled")
+                LazyAnalytics.trackComputerUseRunAborted(reason: "cancelled")
                 break
             } catch {
                 outcomeLine = "The computer-use run failed: \(error.localizedDescription)"
-                ClickyAnalytics.trackComputerUseRunAborted(reason: "error")
+                LazyAnalytics.trackComputerUseRunAborted(reason: "error")
                 recordLastError("computer-use step failed — \(String(error.localizedDescription.prefix(160)))")
                 print("🖥 Computer-use step \(stepNumber) request failed: \(error)")
                 break
             }
-            ClickyLatency.mark("computer-use-step-brain")
+            LazyLatency.mark("computer-use-step-brain")
 
             guard let computerUseAction = Self.parseComputerUseAction(from: stepReplyText) else {
                 consecutiveInvalidStepCount += 1
@@ -536,7 +536,7 @@ extension CompanionManager {
                 handleAgentRunProgressLine("→ step \(stepNumber): no valid action (\(stepReplyText.prefix(60)))", source: source)
                 if consecutiveInvalidStepCount >= Self.maximumConsecutiveInvalidComputerUseSteps {
                     outcomeLine = "I couldn't figure out the next step."
-                    ClickyAnalytics.trackComputerUseRunAborted(reason: "invalid_steps")
+                    LazyAnalytics.trackComputerUseRunAborted(reason: "invalid_steps")
                     break
                 }
                 continue
@@ -547,11 +547,11 @@ extension CompanionManager {
                 outcomeLine = doneSummary.isEmpty
                     ? "Done."
                     : "Done. \(doneSummary)"
-                ClickyAnalytics.trackComputerUseRunCompleted(
+                LazyAnalytics.trackComputerUseRunCompleted(
                     durationMilliseconds: Int(Date().timeIntervalSince(computerUseRunStartDate) * 1000),
                     stepCount: stepNumber - 1
                 )
-                ClickyLatency.mark("computer-use-run-finished")
+                LazyLatency.mark("computer-use-run-finished")
                 print("🖥 Computer-use run finished at step \(stepNumber): \(outcomeLine)")
                 break
             }
@@ -561,7 +561,7 @@ extension CompanionManager {
             handleAgentRunProgressLine("→ \(progressLineText)", source: source)
 
             performComputerUseAction(computerUseAction, on: cursorScreenCapture)
-            ClickyLatency.mark("computer-use-step-executed")
+            LazyLatency.mark("computer-use-step-executed")
 
             // Arm A3 verification: compare this pre-action capture against
             // the next step's capture.
@@ -571,7 +571,7 @@ extension CompanionManager {
             // Last step reached without a GUI_DONE — report the cap.
             if stepNumber == Self.maximumComputerUseStepCount {
                 outcomeLine = "I stopped the computer-use run — hit the step limit after \(Self.maximumComputerUseStepCount) steps."
-                ClickyAnalytics.trackComputerUseRunAborted(reason: "step_limit")
+                LazyAnalytics.trackComputerUseRunAborted(reason: "step_limit")
                 print("🖥 Computer-use run hit the step limit")
                 break
             }

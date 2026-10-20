@@ -617,7 +617,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
         audioEngine.prepare()
         try audioEngine.start()
-        ClickyLatency.mark("mic-capturing")
+        LazyLatency.mark("mic-capturing")
 
         print("🎙️ BuddyDictationManager: opening transcription provider \(transcriptionProvider.displayName)")
 
@@ -654,7 +654,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         self.activeTranscriptionSession = activeTranscriptionSession
         flushPendingAudioBuffers(to: activeTranscriptionSession)
-        ClickyLatency.mark("provider-ready")
+        LazyLatency.mark("provider-ready")
         print("🎙️ BuddyDictationManager: recognition session started")
     }
 

@@ -183,7 +183,7 @@ final class GeminiBrainTransport {
                 // Rate limit fires before any content delta streams (no
                 // partial speech to unwind) — demote and retry once.
                 print("⚠️ Gemini direct: \(passModelID) rate-limited — demoting to \(Self.fallbackModelID)")
-                ClickyAnalytics.trackResponseError(error: "gemini-demote: \(passModelID) 429")
+                LazyAnalytics.trackResponseError(error: "gemini-demote: \(passModelID) 429")
                 isRunningOnFallbackModel = true
                 return try await streamCompletion(
                     modelID: Self.fallbackModelID,

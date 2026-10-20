@@ -765,7 +765,7 @@ extension BundledSkills {
             ## Prerequisites — check before starting
 
             1. Confirm the `computer-use` MCP server is available in the current
-               Codex session. HeyClicky starts it automatically (an embedded
+               Codex session. HeyLazy starts it automatically (an embedded
                cua-driver daemon the app supervises; the MCP entry is a thin proxy
                to it). If the server is ABSENT, the usual cause is that
                Accessibility / Screen Recording aren't granted yet — stop and ask

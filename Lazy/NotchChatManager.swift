@@ -275,7 +275,7 @@ final class NotchChatManager: ObservableObject {
         // The sheet covers the same top-edge strip as the pill — bring the
         // pill back above it so the two read as one continuous notch.
         pillPanel?.orderFrontRegardless()
-        ClickyAnalytics.trackNotchChatOpened()
+        LazyAnalytics.trackNotchChatOpened()
 
         installSheetDismissalMonitors()
 

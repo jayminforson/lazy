@@ -91,7 +91,7 @@ extension CompanionManager {
         ) != todayStamp else { return }
         UserDefaults.standard.set(todayStamp, forKey: CompanionManager.ttsQuotaExhaustedDateUserDefaultsKey)
         recordLastError("my voice service failed, so I'm using my system voice. — \(nsError.localizedDescription.prefix(160))")
-        ClickyAnalytics.trackTTSError(error: "[tts-quota] \(nsError.localizedDescription)")
+        LazyAnalytics.trackTTSError(error: "[tts-quota] \(nsError.localizedDescription)")
         print("🔇 ElevenLabs quota exhausted — system voice for the rest of today")
     }
 
@@ -120,7 +120,7 @@ extension CompanionManager {
     func speakViaSystemVoice(_ utterance: String) {
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
-        ClickyLatency.markFirstTTSPaudio()
+        LazyLatency.markFirstTTSPaudio()
         voiceState = .responding
     }
 
@@ -132,17 +132,17 @@ extension CompanionManager {
         guard !outcomeLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if replyNeedsSystemVoiceFallback || isElevenLabsVoiceDisabledToday {
             speakViaSystemVoice(outcomeLine)
-            ClickyLatency.mark("task-audio-started")
+            LazyLatency.mark("task-audio-started")
             return
         }
         do {
             try await elevenLabsTTSClient.speakText(outcomeLine)
-            ClickyLatency.mark("task-audio-started")
+            LazyLatency.mark("task-audio-started")
             voiceState = .responding
         } catch {
             noteTTSSynthesisFailure(error)
             let failureReason = Self.classifyResponseError(error)
-            ClickyAnalytics.trackTTSError(error: "[voice] \(failureReason) | \(error.localizedDescription)")
+            LazyAnalytics.trackTTSError(error: "[voice] \(failureReason) | \(error.localizedDescription)")
             print("⚠️ ElevenLabs TTS error: \(error)")
             speakRealTextWithSystemVoice(reason: failureReason, detail: error.localizedDescription, text: outcomeLine)
         }

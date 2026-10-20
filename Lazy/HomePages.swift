@@ -48,7 +48,7 @@ private var todayString: String {
 
 // MARK: - Clickys Page
 
-struct HomeClickysPage: View {
+struct HomeCompanionsPage: View {
     @ObservedObject var companionManager: CompanionManager
 
     private var voiceEngineLine: String {
@@ -163,7 +163,7 @@ struct HomeClickysPage: View {
                     .textCase(.uppercase)
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], spacing: 12) {
-                    ForEach(ClickyPersona.builtIns) { persona in
+                    ForEach(LazyPersona.builtIns) { persona in
                         Button {
                             companionManager.setActivePersona(id: persona.id)
                         } label: {
@@ -211,15 +211,15 @@ struct HomeClickysPage: View {
         }
     }
 
-    private func isPersonaActive(_ persona: ClickyPersona) -> Bool {
+    private func isPersonaActive(_ persona: LazyPersona) -> Bool {
         persona.id == companionManager.activePersonaID
     }
 
-    private func personaAccent(_ persona: ClickyPersona) -> Color {
+    private func personaAccent(_ persona: LazyPersona) -> Color {
         Color(hex: persona.accentHex)
     }
 
-    private func personaDisc(_ persona: ClickyPersona) -> some View {
+    private func personaDisc(_ persona: LazyPersona) -> some View {
         let accent = personaAccent(persona)
         let active = isPersonaActive(persona)
         return ZStack {
@@ -479,7 +479,7 @@ struct HomeSuggestionsPage: View {
         return "\(focus) · \(input) · \(batch)"
     }
 
-    private func suggestionCard(_ card: ClickySuggestion) -> some View {
+    private func suggestionCard(_ card: LazySuggestion) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: icon(for: card.kind))
                 .font(.system(size: 13, weight: .medium))
@@ -533,7 +533,7 @@ struct HomeSuggestionsPage: View {
         )
     }
 
-    private func icon(for kind: ClickySuggestion.Kind) -> String {
+    private func icon(for kind: LazySuggestion.Kind) -> String {
         switch kind {
         case .routine: return "arrow.clockwise"
         case .usage: return "clock"
@@ -541,7 +541,7 @@ struct HomeSuggestionsPage: View {
         }
     }
 
-    private func routineRow(_ routine: ClickyRoutine) -> some View {
+    private func routineRow(_ routine: LazyRoutine) -> some View {
         let overdue = routine.isOverdue()
         return HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
@@ -580,7 +580,7 @@ struct HomeSuggestionsPage: View {
         )
     }
 
-    private func routineStatusText(_ routine: ClickyRoutine) -> String {
+    private func routineStatusText(_ routine: LazyRoutine) -> String {
         let cadence = Self.cadenceLabel(hours: routine.intervalHours)
         if routine.isOverdue() {
             return "\(cadence) · was due \(routine.overdueLabel())"

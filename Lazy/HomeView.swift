@@ -197,7 +197,7 @@ struct HomeView: View {
     private var pageContent: some View {
         switch page {
         case .clickys:
-            HomeClickysPage(companionManager: companionManager)
+            HomeCompanionsPage(companionManager: companionManager)
         case .suggestions:
             HomeSuggestionsPage(engine: companionManager.proactiveEngine)
         case .skills:

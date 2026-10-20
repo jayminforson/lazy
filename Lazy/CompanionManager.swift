@@ -79,7 +79,7 @@ enum NotchPillStatus {
 /// since the interaction start and since the previous mark, so the Xcode
 /// console shows exactly where voice-response time is going.
 @MainActor
-enum ClickyLatency {
+enum LazyLatency {
     private static var interactionStartedAt: TimeInterval?
     private static var lastMarkedAt: TimeInterval?
     private static var didMarkFirstTTSPaudio = false
@@ -314,15 +314,15 @@ final class CompanionManager: ObservableObject {
     static let activePersonaDefaultsKey = "clickyActivePersona"
 
     static func loadActivePersonaID() -> String {
-        UserDefaults.standard.string(forKey: activePersonaDefaultsKey) ?? ClickyPersona.defaultID
+        UserDefaults.standard.string(forKey: activePersonaDefaultsKey) ?? LazyPersona.defaultID
     }
 
-    var activePersona: ClickyPersona {
-        ClickyPersona.persona(id: activePersonaID)
+    var activePersona: LazyPersona {
+        LazyPersona.persona(id: activePersonaID)
     }
 
     func setActivePersona(id: String) {
-        guard ClickyPersona.builtIns.contains(where: { $0.id == id }) else { return }
+        guard LazyPersona.builtIns.contains(where: { $0.id == id }) else { return }
         activePersonaID = id
         UserDefaults.standard.set(id, forKey: Self.activePersonaDefaultsKey)
         print("🎭 Persona: \(id)")
@@ -520,7 +520,7 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("🔑 Lazy start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -588,7 +588,7 @@ final class CompanionManager: ObservableObject {
         // again on future launches — the cursor will auto-show instead
         hasCompletedOnboarding = true
 
-        ClickyAnalytics.trackOnboardingStarted()
+        LazyAnalytics.trackOnboardingStarted()
 
         // Play Besaid theme at 60% volume, fade out after 1m 30s
         startOnboardingMusic()
@@ -604,7 +604,7 @@ final class CompanionManager: ObservableObject {
     /// is already visible so we just restart the welcome animation and video.
     func replayOnboarding() {
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        ClickyAnalytics.trackOnboardingReplayed()
+        LazyAnalytics.trackOnboardingReplayed()
         startOnboardingMusic()
         // Tear down any existing overlays and recreate with isFirstAppearance = true
         overlayWindowManager.hasShownOverlayBefore = false
@@ -622,7 +622,7 @@ final class CompanionManager: ObservableObject {
     private func startOnboardingMusic() {
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
+            print("⚠️ Lazy: ff.mp3 not found in bundle")
             return
         }
 
@@ -637,7 +637,7 @@ final class CompanionManager: ObservableObject {
                 self?.fadeOutOnboardingMusic()
             }
         } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
+            print("⚠️ Lazy: Failed to play onboarding music: \(error)")
         }
     }
 
@@ -744,13 +744,13 @@ final class CompanionManager: ObservableObject {
 
         // Track individual permission grants as they happen
         if !previouslyHadAccessibility && hasAccessibilityPermission {
-            ClickyAnalytics.trackPermissionGranted(permission: "accessibility")
+            LazyAnalytics.trackPermissionGranted(permission: "accessibility")
         }
         if !previouslyHadScreenRecording && hasScreenRecordingPermission {
-            ClickyAnalytics.trackPermissionGranted(permission: "screen_recording")
+            LazyAnalytics.trackPermissionGranted(permission: "screen_recording")
         }
         if !previouslyHadMicrophone && hasMicrophonePermission {
-            ClickyAnalytics.trackPermissionGranted(permission: "microphone")
+            LazyAnalytics.trackPermissionGranted(permission: "microphone")
         }
         // Screen content permission is persisted — once the user has approved the
         // SCShareableContent picker, we don't need to re-check it.
@@ -759,7 +759,7 @@ final class CompanionManager: ObservableObject {
         }
 
         if !previouslyHadAll && allPermissionsGranted {
-            ClickyAnalytics.trackAllPermissionsGranted()
+            LazyAnalytics.trackAllPermissionsGranted()
         }
 
         updateNotchChatPillVisibility()
@@ -794,7 +794,7 @@ final class CompanionManager: ObservableObject {
                     guard didCapture else { return }
                     hasScreenContentPermission = true
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                    ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
+                    LazyAnalytics.trackPermissionGranted(permission: "screen_content")
 
                     // If onboarding was already completed, show the cursor overlay now
                     if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
@@ -859,7 +859,7 @@ final class CompanionManager: ObservableObject {
                     self.voiceState = .processing
                 } else if isRecording {
                     if self.voiceState != .listening {
-                        ClickyLatency.mark("listening-ui-shown")
+                        LazyLatency.mark("listening-ui-shown")
                     }
                     self.voiceState = .listening
                 } else if isPreparing {
@@ -918,7 +918,7 @@ final class CompanionManager: ObservableObject {
         // Dictation never hits the brain, so there's no latency chain to
         // measure and no bridge to warm.
         if submissionBehavior == .runAsCommand {
-            ClickyLatency.beginInteraction()
+            LazyLatency.beginInteraction()
         }
 
         // Don't register push-to-talk while the onboarding video is playing
@@ -971,7 +971,7 @@ final class CompanionManager: ObservableObject {
         }
 
 
-        ClickyAnalytics.trackPushToTalkStarted()
+        LazyAnalytics.trackPushToTalkStarted()
 
         // A previous session may still be preparing or finalizing (both can
         // take seconds) — abort it so this press starts immediately instead
@@ -999,10 +999,10 @@ final class CompanionManager: ObservableObject {
                         return
                     }
 
-                    ClickyLatency.mark("transcript-submitted")
+                    LazyLatency.mark("transcript-submitted")
                     self.lastTranscript = finalTranscript
                     print("🗣️ Companion received transcript: \(finalTranscript)")
-                    ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                    LazyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                     self.respond(to: finalTranscript, source: .voice)
                 }
             )
@@ -1014,11 +1014,11 @@ final class CompanionManager: ObservableObject {
         // before the async startPushToTalk had a chance to begin recording.
         // Without this, a quick press-and-release drops the release event and
         // leaves the waveform overlay stuck on screen indefinitely.
-        ClickyAnalytics.trackPushToTalkReleased()
+        LazyAnalytics.trackPushToTalkReleased()
 
         let submissionBehavior = activeKeyboardShortcutSubmissionBehavior
         if submissionBehavior == .runAsCommand {
-            ClickyLatency.mark("key-up")
+            LazyLatency.mark("key-up")
         }
 
         pendingKeyboardShortcutStartTask?.cancel()
@@ -1043,7 +1043,7 @@ final class CompanionManager: ObservableObject {
         }
         screenshotCaptureTask = Task {
             let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-            ClickyLatency.mark("screenshot-ready")
+            LazyLatency.mark("screenshot-ready")
             return (captures, Date())
         }
     }
@@ -1066,7 +1066,7 @@ final class CompanionManager: ObservableObject {
             }
         }
         let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-        ClickyLatency.mark("screenshot-ready")
+        LazyLatency.mark("screenshot-ready")
         return captures
     }
 
@@ -1078,7 +1078,7 @@ final class CompanionManager: ObservableObject {
         guard !sentence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !sentence.contains("[") else { return }
         if voiceState == .processing {
-            ClickyLatency.mark("brain-first-sentence")
+            LazyLatency.mark("brain-first-sentence")
         }
         guard !replyNeedsSystemVoiceFallback, !isElevenLabsVoiceDisabledToday else { return }
         elevenLabsTTSClient.enqueueSentence(sentence)
@@ -1149,7 +1149,7 @@ final class CompanionManager: ObservableObject {
         // mark for a typed reply silently no-ops and the console shows
         // nothing to diagnose.
         if source == .typed {
-            ClickyLatency.beginInteraction()
+            LazyLatency.beginInteraction()
         }
 
         // "stop" / "cancel" while an agent run is executing cancels the
@@ -1169,7 +1169,7 @@ final class CompanionManager: ObservableObject {
                             try await elevenLabsTTSClient.speakText("stopped.")
                         } catch {
                             noteTTSSynthesisFailure(error)
-                            ClickyAnalytics.trackTTSError(error: error.localizedDescription)
+                            LazyAnalytics.trackTTSError(error: error.localizedDescription)
                             print("⚠️ ElevenLabs TTS error: \(error)")
                             speakViaSystemVoice("stopped.")
                         }
@@ -1244,7 +1244,7 @@ final class CompanionManager: ObservableObject {
                     if conversationHistory.count > 10 {
                         conversationHistory.removeFirst(conversationHistory.count - 10)
                     }
-                    ClickyAnalytics.trackAIResponseReceived(response: confirmationOutcomeLine)
+                    LazyAnalytics.trackAIResponseReceived(response: confirmationOutcomeLine)
                     if speakReply {
                         await speakOutcomeLine(confirmationOutcomeLine)
                         if !Task.isCancelled {
@@ -1415,7 +1415,7 @@ final class CompanionManager: ObservableObject {
                 }
                 print("⚡ Instant local action: \(instantActionTask)")
                 let outcomeLine = await executeActionTask(instantActionTask)
-                ClickyLatency.mark("task-executed")
+                LazyLatency.mark("task-executed")
                 guard !Task.isCancelled else { return }
 
                 conversationHistory.append((
@@ -1426,7 +1426,7 @@ final class CompanionManager: ObservableObject {
                     conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
                 print("🧠 Conversation history: \(conversationHistory.count) exchanges")
-                ClickyAnalytics.trackAIResponseReceived(response: outcomeLine)
+                LazyAnalytics.trackAIResponseReceived(response: outcomeLine)
 
                 if speakReply {
                     await speakOutcomeLine(outcomeLine)
@@ -1565,7 +1565,7 @@ final class CompanionManager: ObservableObject {
                             onDelta: { [weak self] displayText in
                                 if !hasMarkedFirstBrainDelta {
                                     hasMarkedFirstBrainDelta = true
-                                    ClickyLatency.mark("brain-first-delta")
+                                    LazyLatency.mark("brain-first-delta")
                                 }
                                 self?.handleStreamedReplyDisplayUpdate(displayText, source: source)
                             }
@@ -1578,7 +1578,7 @@ final class CompanionManager: ObservableObject {
                         // so the next chain link isn't spoken on top of them.
                         elevenLabsTTSClient.stopPlayback()
                         print("⚠️ Gemini direct brain failed, falling back to local bridge: \(error)")
-                        ClickyAnalytics.trackResponseError(error: "gemini: \(error.localizedDescription)")
+                        LazyAnalytics.trackResponseError(error: "gemini: \(error.localizedDescription)")
                     }
                 }
 
@@ -1600,7 +1600,7 @@ final class CompanionManager: ObservableObject {
                             onDelta: { [weak self] displayText in
                                 if !hasMarkedFirstBrainDelta {
                                     hasMarkedFirstBrainDelta = true
-                                    ClickyLatency.mark("brain-first-delta")
+                                    LazyLatency.mark("brain-first-delta")
                                 }
                                 self?.handleStreamedReplyDisplayUpdate(displayText, source: source)
                             }
@@ -1616,7 +1616,7 @@ final class CompanionManager: ObservableObject {
                         // unavailable), fall back to the Cloudflare worker chat
                         // route so interactions still get an answer.
                         print("⚠️ OpenCode bridge failed, falling back to worker chat: \(error)")
-                        ClickyAnalytics.trackResponseError(error: "bridge: \(error.localizedDescription)")
+                        LazyAnalytics.trackResponseError(error: "bridge: \(error.localizedDescription)")
                         didFailOverToWorker = true
 
                         let historyForAPI = conversationHistory.map { entry in
@@ -1630,7 +1630,7 @@ final class CompanionManager: ObservableObject {
                             onTextChunk: { [weak self] accumulatedFallbackReplyText in
                                 if !hasMarkedFirstBrainDelta {
                                     hasMarkedFirstBrainDelta = true
-                                    ClickyLatency.mark("brain-first-delta")
+                                    LazyLatency.mark("brain-first-delta")
                                 }
                                 self?.handleStreamedReplyDisplayUpdate(
                                     Self.displayTextWithoutPointTag(accumulatedFallbackReplyText),
@@ -1642,7 +1642,7 @@ final class CompanionManager: ObservableObject {
                     }
                 }
 
-                ClickyLatency.mark("brain-reply")
+                LazyLatency.mark("brain-reply")
 
                 guard !Task.isCancelled else { return }
 
@@ -1724,7 +1724,7 @@ final class CompanionManager: ObservableObject {
                     // prose before the tag; tag-only replies never queue any).
                     elevenLabsTTSClient.stopPlayback()
                     spokenText = await executeActionTask(actionTask)
-                    ClickyLatency.mark("task-executed")
+                    LazyLatency.mark("task-executed")
                     // The task ran detached from cancellation — if a new
                     // interaction interrupted this one mid-task, drop the
                     // outcome instead of speaking/appending it late.
@@ -1862,7 +1862,7 @@ final class CompanionManager: ObservableObject {
 
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                    LazyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
                     print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                 } else if actionTask == nil && agentRunGoal == nil && computerUseGoal == nil {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
@@ -1882,7 +1882,7 @@ final class CompanionManager: ObservableObject {
 
                 print("🧠 Conversation history: \(conversationHistory.count) exchanges")
 
-                ClickyAnalytics.trackAIResponseReceived(response: spokenText)
+                LazyAnalytics.trackAIResponseReceived(response: spokenText)
 
                 if speakReply {
                     if actionTask != nil || agentRunGoal != nil || computerUseGoal != nil {
@@ -1917,19 +1917,19 @@ final class CompanionManager: ObservableObject {
                                 // as spoken but never made it to audio.
                                 elevenLabsTTSClient.stopPlayback()
                                 speakViaSystemVoice(spokenText)
-                                ClickyLatency.mark("tts-audio-started")
+                                LazyLatency.mark("tts-audio-started")
                             } else if alreadySpokenReplyPrefix.isEmpty {
                                 // No streaming sentences arrived (SSE unavailable) —
                                 // speak the whole reply in one shot, as before.
                                 do {
                                     try await elevenLabsTTSClient.speakText(unspokenReplyText)
-                                    ClickyLatency.mark("tts-audio-started")
+                                    LazyLatency.mark("tts-audio-started")
                                     // speakText returns after player.play() — audio is now playing
                                     voiceState = .responding
                                 } catch {
                                     noteTTSSynthesisFailure(error)
                                     let failureReason = Self.classifyResponseError(error)
-                                    ClickyAnalytics.trackTTSError(error: "[voice] \(failureReason) | \(error.localizedDescription)")
+                                    LazyAnalytics.trackTTSError(error: "[voice] \(failureReason) | \(error.localizedDescription)")
                                     print("⚠️ ElevenLabs TTS error: \(error)")
                                     speakRealTextWithSystemVoice(reason: failureReason, detail: error.localizedDescription, text: unspokenReplyText)
                                 }
@@ -1937,7 +1937,7 @@ final class CompanionManager: ObservableObject {
                                 // Early sentences are already queued — append the
                                 // remainder; the queue plays it after they finish.
                                 elevenLabsTTSClient.enqueueSentence(unspokenReplyText)
-                                ClickyLatency.mark("tts-remainder-queued")
+                                LazyLatency.mark("tts-remainder-queued")
                                 voiceState = .responding
                             }
                         }
@@ -1955,7 +1955,7 @@ final class CompanionManager: ObservableObject {
                 let classifiedReason = didFailOverToWorker
                     ? "my brain and my backup both failed — \(failureReason)"
                     : failureReason
-                ClickyAnalytics.trackResponseError(error: "[response] \(classifiedReason) | \(error.localizedDescription)")
+                LazyAnalytics.trackResponseError(error: "[response] \(classifiedReason) | \(error.localizedDescription)")
                 print("⚠️ Companion response error: \(error)")
                 if speakReply {
                     speakFailureFallback(reason: classifiedReason, detail: error.localizedDescription)
@@ -2010,7 +2010,7 @@ final class CompanionManager: ObservableObject {
         if !fileAttachments.isEmpty {
             print("⌨️ Companion typed message carries \(fileAttachments.count) attachment(s)")
         }
-        ClickyAnalytics.trackUserMessageSent(transcript: trimmedMessageText)
+        LazyAnalytics.trackUserMessageSent(transcript: trimmedMessageText)
         respond(to: trimmedMessageText, source: .typed, fileAttachments: fileAttachments)
     }
 
@@ -2041,15 +2041,15 @@ final class CompanionManager: ObservableObject {
     /// transcript entry + notch badge, never voice. The badge count mirrors
     /// through `unreadSuggestionCount`; opening the sheet or Home →
     /// Suggestions marks everything read.
-    private func deliverScheduledSuggestions(_ cards: [ClickySuggestion], source: ReplySource) {
+    private func deliverScheduledSuggestions(_ cards: [LazySuggestion], source: ReplySource) {
         guard source == .scheduled else { return }
         let text = Self.scheduledAnnouncementText(for: cards)
         appendChatMessage(role: .assistant, text: text)
-        ClickyAnalytics.trackSuggestionDelivered(count: cards.count)
+        LazyAnalytics.trackSuggestionDelivered(count: cards.count)
         print("📅 Scheduled suggestion batch (\(cards.count)) → badge \(proactiveEngine.unreadCount)")
     }
 
-    private static func scheduledAnnouncementText(for cards: [ClickySuggestion]) -> String {
+    private static func scheduledAnnouncementText(for cards: [LazySuggestion]) -> String {
         let hour = Calendar.current.component(.hour, from: Date())
         let greeting: String
         switch hour {
@@ -2083,7 +2083,7 @@ final class CompanionManager: ObservableObject {
         return text
     }
 
-    /// If the cursor is in transient mode (user toggled "Show Clicky" off),
+    /// If the cursor is in transient mode (user toggled "Show Lazy" off),
     /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
@@ -2588,7 +2588,7 @@ final class CompanionManager: ObservableObject {
         case .instantTask(let actionTask, _, _):
             print("🛑 Risk confirmation: yes — running \(actionTask)")
             let outcomeLine = await executeActionTask(actionTask)
-            ClickyLatency.mark("task-executed")
+            LazyLatency.mark("task-executed")
             return outcomeLine
         case .draftSend(let draftID, let recipientName, _, _, _):
             // The approval already happened (the yes); the draft service
@@ -3154,7 +3154,7 @@ final class CompanionManager: ObservableObject {
             forTimes: [NSValue(time: demoTriggerTime)],
             queue: .main
         ) { [weak self] in
-            ClickyAnalytics.trackOnboardingDemoTriggered()
+            LazyAnalytics.trackOnboardingDemoTriggered()
             self?.performOnboardingDemoInteraction()
         }
 
@@ -3165,7 +3165,7 @@ final class CompanionManager: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            ClickyAnalytics.trackOnboardingVideoCompleted()
+            LazyAnalytics.trackOnboardingVideoCompleted()
             self.onboardingVideoOpacity = 0.0
             // Wait for the 2s fade-out animation to complete before tearing down
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {

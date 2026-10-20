@@ -11,7 +11,7 @@ import Foundation
 
 /// One proactive suggestion card: shows in Home → Suggestions, counts into
 /// the notch badge until read, and is never more than one batch a day.
-struct ClickySuggestion: Identifiable, Codable, Equatable {
+struct LazySuggestion: Identifiable, Codable, Equatable {
     enum Kind: String, Codable {
         /// An overdue routine the user should settle.
         case routine
@@ -51,7 +51,7 @@ struct ClickySuggestion: Identifiable, Codable, Equatable {
 
 /// A user-defined routine with a cadence. The engine nudges once a day when
 /// one is past due ("settle overdue routines" — one calm card, never a loop).
-struct ClickyRoutine: Identifiable, Codable, Equatable {
+struct LazyRoutine: Identifiable, Codable, Equatable {
     let id: UUID
     var name: String
     /// Hours between runs (24 = daily, 72 = every three days, ...).

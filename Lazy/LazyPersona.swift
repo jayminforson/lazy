@@ -1,5 +1,5 @@
 //
-//  ClickyPersona.swift
+//  LazyPersona.swift
 //  Clicky
 //
 //  Clickys personas: named companions whose prompt addendum, quip, and
@@ -10,7 +10,7 @@
 
 import Foundation
 
-struct ClickyPersona: Identifiable, Codable, Equatable, Hashable {
+struct LazyPersona: Identifiable, Codable, Equatable, Hashable {
     /// Stable id; also the defaults value for the active persona.
     let id: String
     let name: String
@@ -28,29 +28,29 @@ struct ClickyPersona: Identifiable, Codable, Equatable, Hashable {
 
     static let defaultID = "clicky"
 
-    static let builtIns: [ClickyPersona] = [
-        ClickyPersona(
+    static let builtIns: [LazyPersona] = [
+        LazyPersona(
             id: "clicky",
             name: "Lazy",
             quip: "Lives in your notch. Answers with voice.",
             promptAddendum: "You are Lazy, the default companion: quick, warm, and to the point. Give the fewest words that fully answer.",
             accentHex: "#3B82F6"
         ),
-        ClickyPersona(
+        LazyPersona(
             id: "pip",
             name: "Pip",
             quip: "One-line answers. Zero dithering.",
             promptAddendum: "You are Pip: fast and chatty. Lead with the answer in a single line; add detail only when asked.",
             accentHex: "#F59E0B"
         ),
-        ClickyPersona(
+        LazyPersona(
             id: "sable",
             name: "Sable",
             quip: "Checks twice. Speaks once.",
             promptAddendum: "You are Sable: calm and careful. Note assumptions and risks briefly, then answer plainly.",
             accentHex: "#34D399"
         ),
-        ClickyPersona(
+        LazyPersona(
             id: "juno",
             name: "Juno",
             quip: "Cites sources. Admits unknowns.",
@@ -59,7 +59,7 @@ struct ClickyPersona: Identifiable, Codable, Equatable, Hashable {
         )
     ]
 
-    static func persona(id: String) -> ClickyPersona {
+    static func persona(id: String) -> LazyPersona {
         builtIns.first(where: { $0.id == id }) ?? builtIns[0]
     }
 

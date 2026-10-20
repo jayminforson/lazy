@@ -24,8 +24,8 @@ final class ProactiveSuggestionEngine: ObservableObject {
 
     // MARK: - Published state
 
-    @Published private(set) var suggestions: [ClickySuggestion] = []
-    @Published private(set) var routines: [ClickyRoutine] = []
+    @Published private(set) var suggestions: [LazySuggestion] = []
+    @Published private(set) var routines: [LazyRoutine] = []
     @Published private(set) var isDoNotDisturbActive = false
     @Published private(set) var pauseUntil: Date?
     @Published private(set) var unreadCount = 0
@@ -35,7 +35,7 @@ final class ProactiveSuggestionEngine: ObservableObject {
     /// Set by CompanionManager — receives each delivered batch so the
     /// manager can append the ReplySource.scheduled transcript entry and
     /// update the notch badge mirror.
-    var onDeliverBatch: (([ClickySuggestion]) -> Void)?
+    var onDeliverBatch: (([LazySuggestion]) -> Void)?
 
     // MARK: - Locks / state
 
@@ -160,7 +160,7 @@ final class ProactiveSuggestionEngine: ObservableObject {
         if ruleEnabled(Rules.dnd), isDoNotDisturbActive { return }
         if let paused = pauseUntil, now < paused { return }
 
-        var cards: [ClickySuggestion] = []
+        var cards: [LazySuggestion] = []
 
         if ruleEnabled(Rules.routines) {
             let overdue = routines
@@ -168,7 +168,7 @@ final class ProactiveSuggestionEngine: ObservableObject {
                 .sorted { $0.nextDueDate() < $1.nextDueDate() }
                 .prefix(3)
             cards += overdue.map { routine in
-                ClickySuggestion(
+                LazySuggestion(
                     kind: .routine,
                     title: routine.name,
                     body: "was due \(routine.overdueLabel(asOf: now))",
@@ -181,7 +181,7 @@ final class ProactiveSuggestionEngine: ObservableObject {
            let stretchStart = activeStretchStart,
            now.timeIntervalSince(stretchStart) >= 50 * 60 {
             let minutes = Int(now.timeIntervalSince(stretchStart) / 60)
-            cards.append(ClickySuggestion(
+            cards.append(LazySuggestion(
                 kind: .note,
                 title: "Take five",
                 body: "\(minutes)m straight at the keyboard — stretch while the idea is good."
@@ -208,12 +208,12 @@ final class ProactiveSuggestionEngine: ObservableObject {
         onDeliverBatch?(cards)
     }
 
-    private func makeUsageCard(now: Date) -> ClickySuggestion? {
+    private func makeUsageCard(now: Date) -> LazySuggestion? {
         let yesterday = Self.defaults.dictionary(forKey: Key.usageYesterday) as? [String: Double] ?? [:]
         guard let top = yesterday.max(by: { $0.value < $1.value }), top.value >= 1800 else {
             return nil
         }
-        return ClickySuggestion(
+        return LazySuggestion(
             kind: .usage,
             title: "Yesterday belonged to \(top.key)",
             body: "\(Self.formatDuration(top.value)) there — the most of any app."
@@ -465,7 +465,7 @@ final class ProactiveSuggestionEngine: ObservableObject {
         let lastRun = dueNow
             ? Date().addingTimeInterval(-(intervalHours * 3600) - 60)
             : Date()
-        routines.append(ClickyRoutine(name: trimmed, intervalHours: intervalHours, lastRunDate: lastRun))
+        routines.append(LazyRoutine(name: trimmed, intervalHours: intervalHours, lastRunDate: lastRun))
         persistRoutines()
         print("📅 Routine added: \(trimmed) every \(intervalHours)h")
     }
@@ -486,11 +486,11 @@ final class ProactiveSuggestionEngine: ObservableObject {
 
     private func loadState() {
         if let data = Self.defaults.data(forKey: Key.suggestions),
-           let decoded = try? JSONDecoder().decode([ClickySuggestion].self, from: data) {
+           let decoded = try? JSONDecoder().decode([LazySuggestion].self, from: data) {
             suggestions = decoded
         }
         if let data = Self.defaults.data(forKey: Key.routines),
-           let decoded = try? JSONDecoder().decode([ClickyRoutine].self, from: data) {
+           let decoded = try? JSONDecoder().decode([LazyRoutine].self, from: data) {
             routines = decoded
         }
         if let stamp = Self.defaults.string(forKey: Key.lastDeliveryDay) {

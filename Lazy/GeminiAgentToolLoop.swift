@@ -487,7 +487,7 @@ enum GeminiAgentToolLoop {
     nonisolated private static func runBashCommand(_ command: String) -> String {
         let workDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         let temporaryDirectoryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clicky-agent-tools", isDirectory: true)
+            .appendingPathComponent("lazy-agent-tools", isDirectory: true)
         try? FileManager.default.createDirectory(at: temporaryDirectoryURL, withIntermediateDirectories: true)
         let runIdentifier = UUID().uuidString
         let standardOutputURL = temporaryDirectoryURL.appendingPathComponent("\(runIdentifier).out")

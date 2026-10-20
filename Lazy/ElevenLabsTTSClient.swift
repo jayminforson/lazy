@@ -61,7 +61,7 @@ final class ElevenLabsTTSClient {
         let player = try AVAudioPlayer(data: data)
         audioPlayer = player
         player.play()
-        ClickyLatency.markFirstTTSPaudio()
+        LazyLatency.markFirstTTSPaudio()
         print("🔊 ElevenLabs TTS: playing \(data.count / 1024)KB audio")
     }
 
@@ -139,7 +139,7 @@ final class ElevenLabsTTSClient {
                 guard !data.isEmpty, let player = try? AVAudioPlayer(data: data) else { continue }
                 audioPlayer = player
                 player.play()
-                ClickyLatency.markFirstTTSPaudio()
+                LazyLatency.markFirstTTSPaudio()
                 print("🔊 ElevenLabs TTS: playing queued sentence (\(data.count / 1024)KB)")
             } catch {
                 if error is CancellationError { return }
