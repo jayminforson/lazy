@@ -10,19 +10,24 @@
 //  (Lazy `_shorten_url` port). Same paper/handwriting aesthetic as the
 //  board.
 //
+//  Faithful to the Python file: the popup has NO scroll (the note clips at
+//  the box bottom, like Lazy) and drags from ANYWHERE on its body — ✕ and
+//  link rects win the tap, everything else starts the drag. Shadow is Lazy's
+//  popup value (blur 30 · x4 · y6 · 43 %), not the board's heavier one.
+//
 //  Dismissal, Lazy verbatim: ✕ · any click outside (a transparent full-
 //  screen overlay panel catches it — and, exactly like Lazy's overlay
 //  widget, CONSUMES that first click, so the next click acts normally) ·
-//  opening another popup replaces the current one.
+//  opening another popup replaces the current one. A quick second press on
+//  the overlay at the same spot is routed to the board as a double-click →
+//  the Edit dialog (see StickyBoardManager.handleOverlayPress), so rename
+//  stays reachable even though the overlay eats the board's second click.
 //
 //  Layer: the board's desktop-icon level (M6.5b widget rule — the popup
 //  can never cover windows; Lazy's floated over everything). Consequence:
 //  a click on an app window doesn't reach us at this layer, so the popup
 //  outlives it until ✕ or a desktop click — accepted divergence (recorded
 //  in AGENTS.md). Popup geometry is NOT persisted (Lazy's wasn't either).
-//
-//  Default decisions (user: "go by the default"): desktop-consistent layer;
-//  long notes scroll instead of Lazy's clip at the 280 pt box.
 //
 
 import AppKit
@@ -38,6 +43,12 @@ final class StickyPopupManager {
     private var grabLocal: NSPoint?
 
     var isVisible: Bool { popupPanel != nil }
+
+    /// Called when the transparent overlay catches a press (Lazy's
+    /// `close_popup`). The board installs this to distinguish a quick second
+    /// press (double-click → rename) from a plain dismiss. When nil, an
+    /// overlay press just closes the popup.
+    var onOutsidePress: (() -> Void)?
 
     // Lazy StickyPopup geometry (stickyboard.py: resize(420, 280)).
     static let popupWidth: CGFloat = 420
@@ -71,7 +82,14 @@ final class StickyPopupManager {
                               backing: .buffered, defer: false)
         Self.configure(overlay)
         overlay.contentView = NSHostingView(
-            rootView: StickyPopupOverlayView { [weak self] in self?.close() }
+            rootView: StickyPopupOverlayView { [weak self] in
+                guard let self else { return }
+                if let onOutsidePress {
+                    onOutsidePress()
+                } else {
+                    close()
+                }
+            }
         )
         overlay.orderFrontRegardless()
         overlayPanel = overlay
@@ -162,8 +180,7 @@ struct StickyPopupView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Title bar — bold subject + ✕; grabbing here DRAGS (the board
-            // drags by its header too), so the note area stays scrollable.
+            // Title bar — bold subject + ✕.
             HStack(alignment: .top, spacing: 8) {
                 Text(title)
                     .font(StickyBoardManager.handFont(20))
@@ -185,31 +202,23 @@ struct StickyPopupView: View {
             .padding(.leading, 16)
             .padding(.trailing, 10)
             .frame(height: 44, alignment: .top)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 2)
-                    .onChanged { value in
-                        manager.dragChanged(location: value.location, viewHeight: height)
-                    }
-                    .onEnded { _ in manager.dragEnded() }
-            )
 
             Rectangle()
                 .fill(rule)
                 .frame(height: 1)
                 .padding(.horizontal, 12)
 
-            // Full note — links clickable; scrolls past Lazy's clip height.
-            ScrollView(.vertical) {
-                Text(Self.attributedNote(note, pencil: pencil, linkBlue: linkBlue))
-                    .font(StickyBoardManager.handFont(17))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.bottom, 4)
-            }
-            .scrollIndicators(.hidden)
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
-            .frame(maxHeight: .infinity)
+            // Full note — links clickable. Lazy has NO scroll: the note is
+            // drawn until it would overflow the box, then clipped — so the
+            // whole body can be grabbed to drag.
+            Text(Self.attributedNote(note, pencil: pencil, linkBlue: linkBlue))
+                .font(StickyBoardManager.handFont(17))
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                .padding(.bottom, 8)
+                .frame(maxHeight: .infinity, alignment: .topLeading)
+                .clipped()
         }
         .frame(width: StickyPopupManager.popupWidth, height: height)
         .background(
@@ -220,7 +229,20 @@ struct StickyPopupView: View {
                         .stroke(paperEdge, lineWidth: 1.4)
                 )
         )
-        .shadow(color: .black.opacity(0.39), radius: 24, x: 5, y: 8)
+        // Lazy's popup shadow: QGraphicsDropShadowEffect(blur 30, x 4, y 6,
+        // alpha 110/255 ≈ 0.43) — distinct from the board's heavier shadow.
+        .shadow(color: .black.opacity(0.43), radius: 30, x: 4, y: 6)
+        .contentShape(Rectangle())
+        // Drag from ANYWHERE on the body (Lazy checks ✕ / link rects first,
+        // then starts the drag). minimumDistance keeps a stationary ✕/link
+        // tap from becoming a drag.
+        .gesture(
+            DragGesture(minimumDistance: 2)
+                .onChanged { value in
+                    manager.dragChanged(location: value.location, viewHeight: height)
+                }
+                .onEnded { _ in manager.dragEnded() }
+        )
         .environment(\.openURL, OpenURLAction { url in
             NSWorkspace.shared.open(url) ? .handled : .discarded
         })

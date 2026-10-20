@@ -125,8 +125,6 @@ final class StickyBoardManager: ObservableObject {
     @Published private(set) var items: [StickyItem] = []
     @Published private(set) var boardCount = 1
     @Published var boardIndex = 0
-    @Published var isAddingItem = false
-    @Published var editingItemID: String?
     @Published var flashItemID: String?
     @Published private(set) var isBoardShown = false
 
@@ -135,6 +133,13 @@ final class StickyBoardManager: ObservableObject {
     private var dataObserver: NSObjectProtocol?
     private var finderObserver: NSObjectProtocol?
     private var popupManager: StickyPopupManager?
+    /// The row press that opened the current popup — a fast second press at
+    /// nearly the same spot is a double-click → rename (Lazy's
+    /// mouseDoubleClickEvent, routed through the overlay that would otherwise
+    /// swallow the second click before the board could see a double-click).
+    private var lastPressItem: StickyItem?
+    private var lastPressAt: Date?
+    private var lastPressPoint: NSPoint?
     private var reloadWork: DispatchWorkItem?
     private var flashClearTask: Task<Void, Never>?
     private var dragOrigin: NSPoint?
@@ -256,13 +261,72 @@ final class StickyBoardManager: ObservableObject {
     /// detail, opened near the click (Lazy's `_show_popup`).
     func openPopup(for item: StickyItem) {
         guard isBoardShown else { return }
-        if popupManager == nil { popupManager = StickyPopupManager() }
+        lastPressItem = item
+        lastPressAt = Date()
+        lastPressPoint = NSEvent.mouseLocation
+        if popupManager == nil {
+            let popup = StickyPopupManager()
+            popup.onOutsidePress = { [weak self] in self?.handleOverlayPress() }
+            popupManager = popup
+        }
         popupManager?.show(title: item.title, note: item.note,
                            clickPoint: NSEvent.mouseLocation)
     }
 
     func dismissPopup() {
         popupManager?.close()
+    }
+
+    /// The popup's transparent overlay caught a press. A fast second press at
+    /// nearly the same spot as the row press = double-click → Lazy's
+    /// `_prompt_edit` (made reachable: the overlay otherwise swallows the
+    /// second click before the board ever sees a double-click). Any other
+    /// press just dismisses the popup.
+    private func handleOverlayPress() {
+        let item = lastPressItem
+        let now = NSEvent.mouseLocation
+        let quick = lastPressAt.map { Date.now.timeIntervalSince($0) < 0.30 } ?? false
+        let near = lastPressPoint.map { abs(now.x - $0.x) < 40 && abs(now.y - $0.y) < 40 } ?? false
+        lastPressItem = nil
+        lastPressAt = nil
+        lastPressPoint = nil
+        dismissPopup()
+        if quick, near, let item {
+            promptRename(item)
+        }
+    }
+
+    /// Lazy's `_prompt_add` — QInputDialog equivalent (native app-modal, so
+    /// typing always lands; the inline field never reliably got a key window).
+    func promptAdd() {
+        guard isBoardShown else { return }
+        guard let text = runInputDialog(title: "Add",
+                                        prompt: "New item (a time like ‘friday at 3pm’ works too):") else { return }
+        addItem(text: text)
+    }
+
+    /// Lazy's `_prompt_edit` (double-click) — prefilled Edit dialog; works on
+    /// done rows too (Lazy has no done guard, and `rename` updates the
+    /// session-done title).
+    func promptRename(_ item: StickyItem) {
+        guard let text = runInputDialog(title: "Edit", prompt: "Item:",
+                                        initial: item.title) else { return }
+        rename(item, to: text)
+    }
+
+    private func runInputDialog(title: String, prompt: String, initial: String = "") -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = prompt
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = initial
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return field.stringValue
     }
 
     func toggleBoard() {
@@ -328,16 +392,6 @@ final class StickyBoardManager: ObservableObject {
         let size = Self.defaultSize
         let origin = NSPoint(x: screen.maxX - size.width - 44, y: screen.maxY - 64 - size.height)
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
-    }
-
-    /// The add/edit TextFields need a key window — the nonactivating panel
-    /// becomes key only for the editing session, then steps back.
-    func requestKeyboard() {
-        panel?.makeKey()
-    }
-
-    func releaseKeyboard() {
-        panel?.orderFrontRegardless()
     }
 
     // MARK: Drag + geometry
@@ -466,9 +520,9 @@ final class StickyBoardManager: ObservableObject {
     }
 }
 
-/// Borderless nonactivating panel that CAN become key while an inline
-/// TextField is editing (add/rename), so typing works without the panel
-/// stealing app focus otherwise.
+/// Borderless nonactivating panel that hosts the board. Add/edit use
+/// app-modal dialogs (Lazy's QInputDialog), so the panel no longer needs to
+/// become key — the override is kept but unused.
 final class StickyBoardPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -489,12 +543,8 @@ struct StickyBoardView: View {
     @ObservedObject var manager: StickyBoardManager
 
     @State private var hoverItemID: String?
-    @State private var addText = ""
-    @State private var editText = ""
     @State private var strikeProgress: [String: Double] = [:]
     @State private var isDragging = false
-    @FocusState private var addFieldFocused: Bool
-    @FocusState private var editFieldFocused: Bool
 
     // Metrics from Lazy (font_pt = 20): row = pt+20, header = pt+24, add = pt+22.
     private let rowHeight: CGFloat = 40
@@ -524,6 +574,7 @@ struct StickyBoardView: View {
         }
         .padding(12)
         .rotationEffect(.degrees(-1.5))
+        .help("Lazy's notes — click checkbox to done, click item to see full summary")
     }
 
     // MARK: Header
@@ -622,45 +673,31 @@ struct StickyBoardView: View {
             }
 
             ZStack(alignment: .leading) {
-                if manager.editingItemID == item.id {
-                    TextField("", text: $editText)
-                        .textFieldStyle(.plain)
-                        .font(StickyBoardManager.handFont(20))
-                        .foregroundColor(pencilColor)
-                        .focused($editFieldFocused)
-                        .onSubmit { commitEdit(item) }
-                        .onExitCommand { manager.editingItemID = nil; manager.releaseKeyboard() }
-                        .onChange(of: manager.editingItemID) { _, newID in
-                            if newID == item.id { editFieldFocused = true }
+                Text(item.title)
+                    .font(StickyBoardManager.handFont(20))
+                    .foregroundColor(pencilColor.opacity(progress >= 0.5 ? 0.55 : 1.0))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .overlay(alignment: .leading) {
+                        if progress > 0 {
+                            PencilStrikeShape(progress: progress, jitter: jitter(for: item))
+                                .stroke(
+                                    pencilSoftColor,
+                                    style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
+                                )
+                                .allowsHitTesting(false)
                         }
-                } else {
-                    Text(item.title)
-                        .font(StickyBoardManager.handFont(20))
-                        .foregroundColor(pencilColor.opacity(progress >= 0.5 ? 0.55 : 1.0))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .overlay(alignment: .leading) {
-                            if progress > 0 {
-                                PencilStrikeShape(progress: progress, jitter: jitter(for: item))
-                                    .stroke(
-                                        pencilSoftColor,
-                                        style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
-                                    )
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                }
+                    }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // Lazy: pressing anywhere in the row body (not the checkbox/✕
+            // zones) opens the detail popup — the whole strip is tappable, no
+            // dead margins, and a single tap has no double-tap disambiguation
+            // lag. Rename is a quick second press on the popup overlay
+            // (handleOverlayPress), so both actions stay reachable.
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .padding(.trailing, 8)
-            .onTapGesture(count: 2) {
-                guard !item.done, manager.editingItemID == nil else { return }
-                editText = item.title
-                manager.editingItemID = item.id
-                manager.requestKeyboard()
-            }
+            .contentShape(Rectangle())
             .onTapGesture {
-                guard manager.editingItemID == nil else { return }
                 manager.openPopup(for: item)
             }
 
@@ -708,52 +745,22 @@ struct StickyBoardView: View {
         .onHover { hoverItemID = $0 ? item.id : nil }
     }
 
-    private func commitEdit(_ item: StickyItem) {
-        manager.rename(item, to: editText)
-        manager.editingItemID = nil
-        manager.releaseKeyboard()
-    }
-
     // MARK: Add band
 
     private var addBand: some View {
         HStack(spacing: 6) {
-            if manager.isAddingItem {
-                TextField("+ add something…", text: $addText)
-                    .textFieldStyle(.plain)
-                    .font(StickyBoardManager.handFont(20))
-                    .foregroundColor(pencilColor)
-                    .focused($addFieldFocused)
-                    .onSubmit {
-                        manager.addItem(text: addText)
-                        addText = ""
-                        manager.isAddingItem = false
-                        manager.releaseKeyboard()
-                    }
-                    .onExitCommand {
-                        addText = ""
-                        manager.isAddingItem = false
-                        manager.releaseKeyboard()
-                    }
-                    .onChange(of: manager.isAddingItem) { _, adding in
-                        if adding {
-                            manager.requestKeyboard()
-                            addFieldFocused = true
-                        }
-                    }
-            } else {
-                Button {
-                    manager.isAddingItem = true
-                } label: {
-                    Text("+ add something…")
-                        .font(StickyBoardManager.handFont(20))
-                        .foregroundColor(pencilSoftColor)
-                }
-                .buttonStyle(.plain)
-            }
+            Text("+ add something…")
+                .font(StickyBoardManager.handFont(20))
+                .foregroundColor(pencilSoftColor)
             Spacer()
         }
         .frame(height: addHeight)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Lazy: clicking anywhere on the add band opens the Add dialog.
+            manager.promptAdd()
+        }
     }
 
     // MARK: Helpers

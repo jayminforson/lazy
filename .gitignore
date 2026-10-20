@@ -10,3 +10,5 @@ worker/.dev.vars
 # internal build log — stays on disk, out of the public repo
 AGENTS.md
 CLAUDE.md
+# Lazy's Python reference (dropped in for the M6.8 fidelity audit) — never ships
+stickyboard.py
