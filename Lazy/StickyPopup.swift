@@ -10,10 +10,15 @@
 //  (Lazy `_shorten_url` port). Same paper/handwriting aesthetic as the
 //  board.
 //
-//  Faithful to the Python file: the popup has NO scroll (the note clips at
-//  the box bottom, like Lazy) and drags from ANYWHERE on its body — ✕ and
-//  link rects win the tap, everything else starts the drag. Shadow is Lazy's
-//  popup value (blur 30 · x4 · y6 · 43 %), not the board's heavier one.
+//  Faithful to the Python file: the note area fills the box and the popup
+//  drags from ANYWHERE on its body — ✕ and link rects win the tap,
+//  everything else starts the drag. Shadow is Lazy's popup value (blur 30 ·
+//  x4 · y6 · 43 %), not the board's heavier one. ONE deliberate divergence
+//  (M4.5d, user decision): long notes SCROLL instead of Lazy's hard clip at
+//  the box bottom — the M4.5c second time line ("Your time (GMT): …") pushed
+//  long summaries' tails out of view under the clip. Consequence: inside an
+//  overflowing note a vertical drag scrolls it (the header bar is the drag
+//  surface then); a non-overflowing note drags the popup as before.
 //
 //  Dismissal, Lazy verbatim: ✕ · any click outside (a transparent full-
 //  screen overlay panel catches it — and, exactly like Lazy's overlay
@@ -210,17 +215,19 @@ struct StickyPopupView: View {
                 .frame(height: 1)
                 .padding(.horizontal, 12)
 
-            // Full note — links clickable. Lazy has NO scroll: the note is
-            // drawn until it would overflow the box, then clipped — so the
-            // whole body can be grabbed to drag.
-            Text(Self.attributedNote(note, pencil: pencil, linkBlue: linkBlue))
-                .font(StickyBoardManager.handFont(17))
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
-                .padding(.bottom, 8)
-                .frame(maxHeight: .infinity, alignment: .topLeading)
-                .clipped()
+            // Full note — links clickable. Scrolls when the note overflows
+            // (M4.5d user decision; M6.8's Lazy clip hid the tail of long
+            // summaries once M4.5c added the second time line).
+            ScrollView {
+                Text(Self.attributedNote(note, pencil: pencil, linkBlue: linkBlue))
+                    .font(StickyBoardManager.handFont(17))
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .textSelection(.enabled)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+            .frame(maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(width: StickyPopupManager.popupWidth, height: height)
         .background(

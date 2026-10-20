@@ -67,6 +67,10 @@ final class MailManager: ObservableObject {
     func start() {
         store.open()
         restoreAccountStates()
+        // M4.5d: one-time rewrite of pre-timezone mail cards (dual time lines
+        // + corrected due). Runs before the first poll so a corrected due is
+        // judged against the fresh sync state.
+        backfillMailCardTimezonesIfNeeded()
         startPolling()
         reminderScheduler.start()
     }
@@ -385,7 +389,16 @@ final class MailManager: ObservableObject {
         parts.append("Received: \(message.receivedAt.formatted(date: .abbreviated, time: .shortened))")
         if classification.meeting.date != nil || classification.meeting.time != nil {
             let when = [classification.meeting.date, classification.meeting.time].compactMap { $0 }.joined(separator: " · ")
-            parts.append("When: \(when)")
+            // M4.5c: when the mail wrote its own zone, show the time exactly as
+            // emailed AND what it lands as locally — a US school's "4:15 PM ET"
+            // otherwise reads as 4:15 in the user's own zone. No zone written →
+            // the single line as before, never an invented conversion.
+            if let zoneLabel = classification.meetingZoneLabel, let start = classification.meetingStart {
+                parts.append("When (as emailed): \(when) \(zoneLabel)")
+                parts.append("Your time (\(CompanionManager.localTimezoneAbbreviation)): \(start.formatted(date: .abbreviated, time: .shortened))")
+            } else {
+                parts.append("When: \(when)")
+            }
         }
         if let link = classification.meeting.link {
             parts.append("Join → \(link)")
@@ -403,6 +416,69 @@ final class MailManager: ObservableObject {
         let dueLine = classification.meetingStart
             .map { " due \($0.formatted(date: .omitted, time: .shortened))" } ?? ""
         print("🗒 Board: +mail card \(tag) \(title.prefix(40))\(dueLine)")
+    }
+
+    /// M4.5d — one-time backfill of cards synced BEFORE the M4.5c timezone
+    /// fix (the flagged gap): they carry the old single "When:" line with no
+    /// zone, and their due was materialised in the machine's zone from the
+    /// school's wall clock — a US "4:15 PM ET" sat as 4:15 GMT and the ⏰
+    /// banner fired 4 h late. Re-runs the M4.5c classifier over the stored
+    /// body; when the mail states its own zone, the note gains the dual
+    /// lines AND the due is corrected to the true instant. Cards without a
+    /// zone, without a When line, or whose bodies the 30-day purge emptied
+    /// stay byte-identical (never an invented conversion, never a lost note).
+    func backfillMailCardTimezonesIfNeeded() {
+        let flagKey = "clickyMailCardTimezoneBackfillV1"
+        guard !UserDefaults.standard.bool(forKey: flagKey) else { return }
+        let cards = store.listMailCardRows()
+        var rewritten = 0
+        var skippedNoBody = 0
+        for card in cards {
+            let keyParts = card.dedupeKey.split(separator: ":", maxSplits: 1)
+            guard keyParts.count == 2,
+                  let provider = MailProvider(rawValue: String(keyParts[0])),
+                  let message = store.storedMessage(provider: provider, providerID: String(keyParts[1])),
+                  !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                skippedNoBody += 1
+                continue
+            }
+            let classification = MailClassifier.classify(
+                sender: message.senderEmail ?? message.senderName ?? "",
+                subject: message.subject,
+                body: message.body
+            )
+            guard let zoneLabel = classification.meetingZoneLabel,
+                  let start = classification.meetingStart,
+                  let rewrittenNote = rewrittenNote(card.note, asEmailedLinePrefix: "When:", zoneLabel: zoneLabel, start: start)
+            else { continue }
+            store.updateMailCardPresentation(id: card.id, note: rewrittenNote, dueAt: classification.meetingStart)
+            rewritten += 1
+            let dueLine = classification.meetingStart
+                .map { " due \($0.formatted(date: .omitted, time: .shortened))" } ?? ""
+            print("🗒 Board: backfilled card \(card.title.prefix(40))\(dueLine)")
+        }
+        UserDefaults.standard.set(true, forKey: flagKey)
+        let untouched = cards.count - rewritten
+        print("📧 Mail: timezone card backfill done — \(rewritten) rewritten, \(untouched) untouched (\(skippedNoBody) without bodies)")
+        BrainLog.line("mail backfill: \(rewritten) rewritten / \(untouched) untouched of \(cards.count) mail cards")
+    }
+
+    /// Rewrites a pre-M4.5c note's single "When: …" line into the two-line
+    /// form (as-emailed + local conversion), every other line — From,
+    /// Received, Join, summary — kept byte-identical. Nil when there is no
+    /// "When:" line to fix.
+    private func rewrittenNote(_ note: String?, asEmailedLinePrefix prefix: String, zoneLabel: String, start: Date) -> String? {
+        guard let note else { return nil }
+        var lines = note.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let whenIndex = lines.firstIndex(where: { $0.hasPrefix(prefix) }) else { return nil }
+        let asEmailed = String(lines[whenIndex].dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+        lines[whenIndex] = "When (as emailed): \(asEmailed) \(zoneLabel)"
+        lines.insert(
+            "Your time (\(CompanionManager.localTimezoneAbbreviation)): \(start.formatted(date: .abbreviated, time: .shortened))",
+            at: whenIndex + 1
+        )
+        return lines.joined(separator: "\n")
     }
 
     func addTodoItem(title: String, dueAt: Date? = nil, details: String? = nil) {

@@ -519,6 +519,12 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        // M4.5d: the beachball names itself (main-thread stack dump after 3s
+        // unresponsive) + the brain chain logs to disk — Xcode's console dies
+        // with Xcode, so a hang must leave evidence behind (brain.log).
+        MainThreadStallReporter.start()
+        BrainLog.line("— Clicky launched —")
+
         refreshAllPermissions()
         print("🔑 Lazy start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
@@ -1536,9 +1542,13 @@ final class CompanionManager: ObservableObject {
                 // hook instruction; time-sensitive phrasing gets a format-free
                 // reminder. Gemini link only: the marker format lives solely
                 // in that transport's prompt, so serve/worker fallbacks can
-                // never leak a raw marker into speech.
+                // never leak a raw marker into speech. Skipped when the
+                // transport already searched proactively (M4.5b) — the hook
+                // instruction is suppressed on those turns, so pointing at it
+                // would only confuse the model.
                 if geminiBrainTransport.isConfigured,
-                   Self.needsCurrentInformation(userMessageText) {
+                   Self.needsCurrentInformation(userMessageText),
+                   !Self.warrantsProactiveSearch(userMessageText) {
                     brainUserPrompt += "\n\nThis may need current information — if the answer could have changed recently, use your web search hook from your instructions first."
                 }
 
@@ -1559,6 +1569,10 @@ final class CompanionManager: ObservableObject {
                             semanticModelChoice: selectedModel,
                             userPrompt: brainUserPrompt,
                             conversationSeed: conversationSeedForNewSession(),
+                            // M4.5b: the raw utterance, not brainUserPrompt — that
+                            // one carries the skills/nudge/awareness blocks and
+                            // would make a noisy search query.
+                            searchQueryHint: userMessageText,
                             onSentenceReady: speakReply ? { [weak self] sentence in
                                 self?.handleEarlyReplySentence(sentence)
                             } : nil,

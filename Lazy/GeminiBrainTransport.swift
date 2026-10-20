@@ -40,7 +40,11 @@ final class GeminiBrainTransport {
 
     /// Per-request timeout. Multi-monitor screenshots are large and the
     /// smart model can reason for a while before its first delta.
-    private static let requestTimeoutInSeconds: TimeInterval = 180
+    /// Per-pass idle timeout (M4.5d: was 180 — a wedged free-tier stream
+    /// then held the turn for three minutes with zero visible text; 60 s
+    /// of TOTAL silence is generous for a live stream and bounds each
+    /// stall. The turn watchdog below caps the whole turn regardless).
+    private static let requestTimeoutInSeconds: TimeInterval = 60
 
     /// UserDefaults key holding the persisted text-only conversation history.
     private static let historyUserDefaultsKey = "geminiBrainConversationHistory"
@@ -87,6 +91,9 @@ final class GeminiBrainTransport {
         case httpFailure(statusCode: Int, bodySnippet: String)
         case streamError(message: String)
         case emptyReply
+        /// M4.5d turn watchdog: the whole turn (search + up to three passes)
+        /// blew its hard wall clock — cancelled, never left hanging.
+        case turnTimedOut(seconds: Int)
 
         var errorDescription: String? {
             switch self {
@@ -98,6 +105,8 @@ final class GeminiBrainTransport {
                 return "Gemini stream error: \(message)"
             case .emptyReply:
                 return "Gemini returned an empty reply"
+            case .turnTimedOut(let seconds):
+                return "Gemini brain turn timed out after \(seconds)s"
             }
         }
 
@@ -127,12 +136,74 @@ final class GeminiBrainTransport {
     /// Mirrors `OpenCodeChatClient.analyzeScreenshots`: streams the reply
     /// through the same sentence/display callbacks and returns the same
     /// `StreamedReply` shape (already-spoken prefix for the TTS remainder).
+    ///
+    /// M4.5d — the whole turn (proactive search + up to three model passes)
+    /// races a hard wall clock. A wedged SSE stream or a stalled link can
+    /// no longer hold the turn open with zero visible text — the 2026-10-20
+    /// freeze was exactly that: search silently dead → marker round → up to
+    /// 3 × idle timeout of nothing. On expiry the in-flight turn is
+    /// cancelled; `respond`'s catch falls through the chain, and if the
+    /// whole chain is dead the failure is spoken honestly via the system
+    /// voice + chip (no invisible hanging anywhere). User interrupts stay
+    /// interrupts: only a FIRED watchdog converts the cancellation into a
+    /// timeout error.
+    private static let turnDeadlineSeconds: Double = 240
+
     func analyzeScreenshots(
         images: [(data: Data, label: String)],
         systemPrompt: String,
         semanticModelChoice: String,
         userPrompt: String,
         conversationSeed: String?,
+        searchQueryHint: String? = nil,
+        onSentenceReady: ((String) -> Void)? = nil,
+        onDelta: ((String) -> Void)? = nil
+    ) async throws -> OpenCodeChatClient.StreamedReply {
+        let turnTask = Task {
+            try await runChatTurn(
+                images: images,
+                systemPrompt: systemPrompt,
+                semanticModelChoice: semanticModelChoice,
+                userPrompt: userPrompt,
+                conversationSeed: conversationSeed,
+                searchQueryHint: searchQueryHint,
+                onSentenceReady: onSentenceReady,
+                onDelta: onDelta
+            )
+        }
+        let watchdog = Task { () -> Bool in
+            try? await Task.sleep(nanoseconds: UInt64(Self.turnDeadlineSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return false }
+            let seconds = Int(Self.turnDeadlineSeconds)
+            print("🛑 Gemini direct: turn deadline (\(seconds)s) — cancelling the brain turn")
+            BrainLog.line("brain: TURN DEADLINE \(seconds)s — cancelling")
+            LazyAnalytics.trackResponseError(error: "gemini-turn-deadline")
+            turnTask.cancel()
+            return true
+        }
+        defer { watchdog.cancel() }
+        do {
+            return try await turnTask.value
+        } catch is CancellationError {
+            // An outer cancel (user interrupt) cascades into BOTH children —
+            // the watchdog never fired. Only a fired watchdog = real timeout.
+            let deadlineFired = await watchdog.value
+            if deadlineFired {
+                throw TransportError.turnTimedOut(seconds: Int(Self.turnDeadlineSeconds))
+            }
+            throw CancellationError()
+        }
+    }
+
+    /// The actual turn (the pre-M4.5d analyzeScreenshots body, renamed —
+    /// the public entry above wraps it in the turn watchdog).
+    private func runChatTurn(
+        images: [(data: Data, label: String)],
+        systemPrompt: String,
+        semanticModelChoice: String,
+        userPrompt: String,
+        conversationSeed: String?,
+        searchQueryHint: String? = nil,
         onSentenceReady: ((String) -> Void)? = nil,
         onDelta: ((String) -> Void)? = nil
     ) async throws -> OpenCodeChatClient.StreamedReply {
@@ -159,12 +230,63 @@ final class GeminiBrainTransport {
 
         print("🧠 Gemini direct: model=\(primaryModelID), \(images.count) image(s), history=\(conversationHistoryMessages.count)")
 
+        let brainStartedAt = ProcessInfo.processInfo.systemUptime
+        var passMessages = messages
+
+        // M4.5b — proactive single-pass search: a high-precision cue match
+        // searches BEFORE the first model call, so a current-info ask costs one
+        // round-trip instead of marker-pass + search + answer-pass (the "a
+        // little bit slower" the user felt). The marker hook below stays as the
+        // fallback for queries the cues miss — but NEVER on a turn where we
+        // already searched, success or failure (M4.5d: a failed search left
+        // `searchedAhead` false, so the model still got the [SEARCH:] hook and
+        // the marker round re-searched the same dead endpoint — up to three
+        // model passes of nothing, which is what froze the drill).
+        var searchAttemptedAhead = false
+        var searchedAhead = false
+        if let hint = searchQueryHint, CompanionManager.warrantsProactiveSearch(hint) {
+            searchAttemptedAhead = true
+            let searchStartedAt = ProcessInfo.processInfo.systemUptime
+            let note = await Self.proactiveSearchNote(for: hint)
+            let searchMilliseconds = Int((ProcessInfo.processInfo.systemUptime - searchStartedAt) * 1000)
+            LazyLatency.mark("web-search")
+            let partText: String
+            if let note {
+                searchedAhead = true
+                print("⏱ WebSearch: \(searchMilliseconds)ms (proactive) — answering in one model pass")
+                partText = note
+            } else {
+                // M4.5d — one search attempt per turn, and an honest one: the
+                // model is TOLD the search failed instead of being left to
+                // guess (fabricated match times were the drill's worst
+                // output) or pointed at a hook it must not use again.
+                print("⏱ WebSearch: \(searchMilliseconds)ms — search unavailable, telling the model not to guess")
+                BrainLog.line("websearch: proactive search unavailable for \"\(hint.prefix(60))\" — honest note appended")
+                partText = Self.searchUnavailableNote
+            }
+            // Fold the note into the user turn as one more text part — the
+            // same shape `userPrompt` uses. content is an ARRAY of parts
+            // (screenshots + labels + prompt), so treating it as a String
+            // would wipe the screenshots and the question.
+            if var lastMessage = passMessages.last, lastMessage["role"] as? String == "user" {
+                if var parts = lastMessage["content"] as? [[String: Any]] {
+                    parts.append(["type": "text", "text": partText])
+                    lastMessage["content"] = parts
+                } else {
+                    lastMessage["content"] = ((lastMessage["content"] as? String) ?? "") + "\n\n" + partText
+                }
+                passMessages[passMessages.count - 1] = lastMessage
+            }
+        }
+
         // Freshness: the search-hook instruction rides only on THIS link.
-        var requestMessages = messages
-        if var systemMessage = requestMessages.first, systemMessage["role"] as? String == "system" {
+        // Suppressed whenever we already searched — success OR failure: one
+        // search attempt per turn, no exceptions (M4.5d).
+        if !searchAttemptedAhead,
+           var systemMessage = passMessages.first, systemMessage["role"] as? String == "system" {
             let baseSystemPrompt = (systemMessage["content"] as? String) ?? ""
             systemMessage["content"] = baseSystemPrompt + "\n\n" + Self.currentInfoSearchInstruction
-            requestMessages[0] = systemMessage
+            passMessages[0] = systemMessage
         }
 
         // One smart→fast demotion budget shared by every pass (the search
@@ -193,16 +315,18 @@ final class GeminiBrainTransport {
             }
         }
 
-        // Freshness two-pass: a strict [SEARCH: ...] reply means the model
-        // needs the web — search keylessly (WebSearch), feed the results
-        // back, let it answer. Marker rounds never touch the streamer, so
-        // TTS and the chat bubble only ever see the final real reply. Max
-        // two search rounds per interaction keeps latency bounded.
-        var passMessages = requestMessages
+        // Freshness fallback: a strict [SEARCH: ...] reply means the model still
+        // needs the web — search keylessly (WebSearch), feed the results back,
+        // let it answer. Marker rounds never touch the streamer, so TTS and the
+        // chat bubble only ever see the final real reply. Max two search rounds
+        // keeps latency bounded; the proactive path above usually makes this
+        // loop run exactly once.
         var searchRoundsUsed = 0
         var finalReplyText = ""
+        var passesRun = 0
 
         while true {
+            passesRun += 1
             let passText = try await runPass(passMessages)
             guard let searchQuery = Self.extractStrictSearchMarker(from: passText)
                 ?? Self.extractAnySearchMarker(from: passText) else {
@@ -212,15 +336,32 @@ final class GeminiBrainTransport {
             guard searchRoundsUsed < 2 else {
                 // Budget spent — never let the raw marker reach speech.
                 print("🌐 brain: search-round budget exhausted — honest fallback line")
+                BrainLog.line("brain: search-round budget exhausted — honest fallback line")
                 finalReplyText = "my search hook didn't come back with anything — try asking me again in a moment."
                 break
             }
             searchRoundsUsed += 1
             print("🌐 brain: [SEARCH: \(searchQuery)] → fetching")
+            BrainLog.line("brain: marker round \(searchRoundsUsed) — [SEARCH: \(searchQuery)]")
             let outcomeNote = await Self.searchOutcomeNote(for: searchQuery)
             passMessages.append(["role": "assistant", "content": passText])
             passMessages.append(["role": "user", "content": outcomeNote])
         }
+
+        let brainSeconds = ProcessInfo.processInfo.systemUptime - brainStartedAt
+        let searchStatus = searchedAhead ? "searched first" : (searchAttemptedAhead ? "search failed (honest note)" : "no proactive search")
+        print(String(
+            format: "⏱ Gemini brain: %.1fs · %@ · %d model pass(es)",
+            brainSeconds,
+            searchStatus,
+            passesRun
+        ))
+        BrainLog.line(String(
+            format: "brain: turn %.1fs · %@ · %d pass(es)",
+            brainSeconds,
+            searchStatus,
+            passesRun
+        ))
 
         rememberExchange(userTurnText: historyUserTurnText, replyText: finalReplyText)
 
@@ -266,6 +407,22 @@ final class GeminiBrainTransport {
         return innerQuery
     }
 
+    /// M4.5b results block for a search that ran BEFORE the model call.
+    /// Returns nil when the search found nothing — the caller then just lets
+    /// the model answer from its own knowledge, never inventing freshness.
+    private static func proactiveSearchNote(for query: String) async -> String? {
+        guard let results = await WebSearch.search(query), !results.isEmpty else { return nil }
+        let resultLines = results
+            .map { "- \($0.title) | \($0.url)\n  \($0.snippet)" }
+            .joined(separator: "\n")
+        return """
+        (web search results for \u{201C}\(query)\u{201D}, fetched just now — trust these over your older knowledge:)
+        \(resultLines)
+
+        (times in these results are often stated in another timezone — convert them to the user's local zone before answering)
+        """
+    }
+
     /// Keyless search round-trip note for the second pass — honest on
     /// failure (the truthful-failure convention: no invented freshness).
     private static func searchOutcomeNote(for query: String) async -> String {
@@ -281,9 +438,18 @@ final class GeminiBrainTransport {
         web search results for \u{201C}\(query)\u{201D}:
         \(resultLines)
 
-        use these current results to answer the user's original question, in your normal voice and style; when they conflict with your older knowledge, trust the results. do not output [SEARCH: ...] again unless you truly need a different query.
+        use these current results to answer the user's original question, in your normal voice and style; when they conflict with your older knowledge, trust the results. times in these results are often stated in another timezone — convert them to the user's local zone before answering. this turn's search budget is spent: never emit a search marker again, answer from these results.
         """
     }
+
+    /// M4.5d — what the model is told when a cue-matched search came back
+    /// empty. The old behavior (telling it nothing) let it fabricate live
+    /// facts — an invented football fixture time was the visible symptom of
+    /// the 2026-10-20 freeze. Never mentions the marker (mentioning the hook
+    /// invites using it).
+    private static let searchUnavailableNote = """
+    (web search is UNAVAILABLE right now — the search engines did not answer, so there is nothing current to check. do NOT guess times, scores, prices, versions, or other live facts. answer from the date and time context only when you safely can, and when the question truly needs today's live information, say plainly that you couldn't verify it online.)
+    """
 
     // MARK: - Request building
 
@@ -346,6 +512,10 @@ final class GeminiBrainTransport {
         guard let endpointURL = URL(string: Self.chatCompletionsEndpoint) else {
             throw TransportError.streamError(message: "invalid Gemini endpoint URL")
         }
+        // M4.5b: per-pass visibility — ttft (request → first delta) is what the
+        // user actually feels, and a marker round shows up here as two passes.
+        let passStartedAt = ProcessInfo.processInfo.systemUptime
+        var firstDeltaAt: TimeInterval?
 
         let requestBody: [String: Any] = [
             "model": modelID,
@@ -425,6 +595,9 @@ final class GeminiBrainTransport {
             }
 
             accumulatedReplyText += deltaText
+            if firstDeltaAt == nil {
+                firstDeltaAt = ProcessInfo.processInfo.systemUptime
+            }
 
             if !isStreamingLive {
                 heldBackText += deltaText
@@ -457,6 +630,11 @@ final class GeminiBrainTransport {
            Self.extractStrictSearchMarker(from: accumulatedReplyText) == nil {
             sentenceStreamer.appendDelta(heldBackText)
         }
+        print(String(
+            format: "⏱ Gemini pass: ttft=%dms total=%dms",
+            firstDeltaAt.map { Int(($0 - passStartedAt) * 1000) } ?? -1,
+            Int((ProcessInfo.processInfo.systemUptime - passStartedAt) * 1000)
+        ))
         return accumulatedReplyText
     }
 

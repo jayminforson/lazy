@@ -210,6 +210,12 @@ extension CompanionManager {
             // turn so "today"-shaped questions can't go archaic. (The web
             // search hook itself lives only in the Gemini transport's prompt.)
             "today's date: \(Self.currentDateDescription()). anchor every date, day-of-week, and \"this week/month/year\" reasoning on that — it's the user's local date, not just your training snapshot.",
+            // M4.5c — timezone anchor, the companion to the date above and
+            // covering ALL three chain links the same way. Without it the
+            // model relabels a venue's clock as the user's: a 21:00 CEST
+            // kickoff answered as "9 PM" to someone in GMT. Live-read from
+            // TimeZone.current each turn, so DST and travel are handled.
+            "the user's local timezone: \(Self.localTimezoneDescription()); local time now: \(Self.localTimeNowDescription()). EVERY time you state — kickoff times, departures, deadlines, \"at 8\", \"in 2 hours\" — must be in the user's local timezone. sources (especially web results) often state times in another zone; convert, and never present a foreign time as if it were local.",
             activePersona.promptBlock()
         ]
 
@@ -269,6 +275,29 @@ extension CompanionManager {
         return currentInfoCues.contains { loweredText.contains($0) }
     }
 
+    /// M4.5b: the high-precision subset that triggers an actual web search
+    /// BEFORE the model call. The broad list above drives only the free nudge;
+    /// paying 1–3 s of search on a substring false positive ("what did I do
+    /// today") would be a latency regression, so searching needs cues that
+    /// almost always mean "go look this up".
+    /// M4.5c added the time-shaped cues — "which time will X play Y today"
+    /// matched only the broad "today" and fell to the slow marker path, and a
+    /// kickoff/departure/fixture time is always live data. "schedule" is
+    /// deliberately absent: "what's my schedule" is about their calendar.
+    static func warrantsProactiveSearch(_ text: String) -> Bool {
+        let loweredText = text.lowercased()
+        let preciseCues = [
+            "latest", "current", "right now",
+            "news", "weather", "forecast",
+            "score", "scores", "price", "prices",
+            "version", "released", "out now", "changelog",
+            "what's new", "whats new", "who won",
+            "what time", "kick off", "kickoff", "kick-off", "fixtures",
+            "2026", "2025"
+        ]
+        return preciseCues.contains { loweredText.contains($0) }
+    }
+
     /// Today's local date, spelled out for the model.
     private static let currentDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -277,8 +306,44 @@ extension CompanionManager {
         return formatter
     }()
 
+    private static let localTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h:mm a"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
     static func currentDateDescription() -> String {
         currentDateFormatter.string(from: Date())
+    }
+
+    /// M4.5c — the user's local zone, read live from the system so it follows
+    /// travel, a manual zone change, and DST. Without this the model hands
+    /// back a venue's time labelled as the user's: a 21:00 CEST kickoff read
+    /// as "9 PM" by someone in GMT.
+    static func localTimezoneDescription() -> String {
+        let zone = TimeZone.current
+        let abbreviation = zone.abbreviation() ?? "UTC"
+        let offsetHours = Double(zone.secondsFromGMT(for: Date())) / 3600.0
+        let offsetText = String(
+            format: "%@%02d:%02d",
+            offsetHours < 0 ? "-" : "+",
+            Int(abs(offsetHours)),
+            Int(abs(offsetHours.truncatingRemainder(dividingBy: 1)) * 60)
+        )
+        return "\(zone.identifier) (\(abbreviation), UTC\(offsetText))"
+    }
+
+    /// Local wall clock now, 12-hour, matching how the user speaks — lets the
+    /// model reason about "in 2 hours" instead of guessing.
+    static func localTimeNowDescription() -> String {
+        localTimeFormatter.string(from: Date())
+    }
+
+    /// Short zone tag for compact surfaces (sticky-note card lines), e.g.
+    /// "GMT" / "EST" — the full description above is too long for a card.
+    static var localTimezoneAbbreviation: String {
+        TimeZone.current.abbreviation() ?? "UTC"
     }
 
 }

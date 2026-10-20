@@ -27,6 +27,11 @@ extension CompanionManager {
         if nsError.domain == "ElevenLabsTTS" {
             return "my voice service failed, so I'm using my system voice."
         }
+        if let transport = error as? GeminiBrainTransport.TransportError,
+           case .turnTimedOut = transport {
+            // M4.5d watchdog — honest about the wait, never pretends an answer exists.
+            return "my brain took too long to answer, so I stopped waiting — try asking me again."
+        }
         if lower.contains("free tier") || lower.contains("rate limit")
             || lower.contains("too many requests") || lower.contains("http 429") {
             return "my free brain is rate-limited right now — try again in a minute."
@@ -52,6 +57,9 @@ extension CompanionManager {
         UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: CompanionManager.lastErrorTimestampUserDefaultsKey)
         lastErrorText = message
         lastErrorDate = stamp
+        // M4.5d: every chip-worthy failure also lands on disk — the console
+        // dies with Xcode, the chip's cause must not die with it.
+        BrainLog.line("error: \(message)")
     }
 
 

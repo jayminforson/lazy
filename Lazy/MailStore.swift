@@ -346,6 +346,32 @@ final class MailStore {
         return Int(sqlite3_column_int64(statement, 0))
     }
 
+    /// M4.5d backfill support: the stored message row (body included) for a
+    /// mail card's dedupe key. The body may be empty — the 30-day purge —
+    /// and the caller then leaves the old card untouched.
+    func storedMessage(provider: MailProvider, providerID: String) -> MailStoreMessage? {
+        guard let statement = prepare("""
+        SELECT provider, provider_id, sender_name, sender_email, subject, body, received_at
+        FROM message WHERE provider = ? AND provider_id = ? LIMIT 1;
+        """) else { return nil }
+        defer { sqlite3_finalize(statement) }
+        bind(provider.rawValue, to: statement, at: 1)
+        bind(providerID, to: statement, at: 2)
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let providerValue = textColumn(statement, 0).flatMap(MailProvider.init(rawValue:))
+        else { return nil }
+        return MailStoreMessage(
+            provider: providerValue,
+            providerID: textColumn(statement, 1) ?? "",
+            threadID: nil,
+            senderName: textColumn(statement, 2),
+            senderEmail: textColumn(statement, 3),
+            subject: textColumn(statement, 4) ?? "",
+            body: textColumn(statement, 5) ?? "",
+            receivedAt: dateColumn(statement, 6) ?? Date()
+        )
+    }
+
     /// Lazy's retention rule: bodies older than the window are nulled out
     /// (metadata kept for search).
     func purgeBodies(olderThanDays days: Int) {
@@ -516,6 +542,49 @@ final class MailStore {
         bind(dedupeKey, to: statement, at: 1)
         guard sqlite3_step(statement) == SQLITE_ROW else { return false }
         return sqlite3_column_int64(statement, 0) > 0
+    }
+
+    /// M4.5d: every mail card with its dedupe key — the one field the board
+    /// queries deliberately don't carry; the timezone backfill needs it to
+    /// find each card's source message.
+    struct MailCardRow {
+        let id: Int64
+        let title: String
+        let note: String?
+        let dedupeKey: String
+    }
+
+    func listMailCardRows() -> [MailCardRow] {
+        guard let statement = prepare("""
+        SELECT id, title, note, dedupe_key FROM reminder
+        WHERE dedupe_key LIKE 'mail:%';
+        """) else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var rows: [MailCardRow] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let dedupeKey = textColumn(statement, 3) else { continue }
+            rows.append(MailCardRow(
+                id: sqlite3_column_int64(statement, 0),
+                title: textColumn(statement, 1) ?? "",
+                note: textColumn(statement, 2),
+                dedupeKey: dedupeKey
+            ))
+        }
+        return rows
+    }
+
+    /// M4.5d: rewrite a mail card's note + due (the one-time timezone
+    /// backfill). A nil dueAt deliberately CLEARS the due — when the true
+    /// instant is already past, the M6.6 future guard returns nil and an
+    /// old wrong-zone due must not keep firing the 15 s scheduler.
+    func updateMailCardPresentation(id: Int64, note: String, dueAt: Date?) {
+        guard let statement = prepare("UPDATE reminder SET note = ?, due_at = ? WHERE id = ?;") else { return }
+        defer { sqlite3_finalize(statement) }
+        bind(note, to: statement, at: 1)
+        bind(dueAt.map { Self.isoFormatter.string(from: $0) }, to: statement, at: 2)
+        sqlite3_bind_int64(statement, 3, id)
+        guard sqlite3_step(statement) == SQLITE_DONE else { return }
+        postBoardChanged()
     }
 
     /// Ordering mirrors Lazy: due-dated first (oldest first), undated after,

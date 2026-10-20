@@ -25,7 +25,14 @@ struct MailClassification {
     /// Lazy's `due_at` (orchestrator `_mail_to_board`): the event's parsed
     /// start time — local, future-only, nil unless `hasEvent`. Drives the
     /// card's due-first sort and the ⏰ scheduler banner at meeting time.
+    /// M4.5c: when the mail states its own zone, this is the TRUE instant
+    /// (converted), not the email's wall clock stamped onto yours.
     let meetingStart: Date?
+    /// M4.5c: the short zone label the mail itself wrote ("ET", "UTC"),
+    /// nil when the mail gave no zone — so the card can show the time as
+    /// emailed and the converted local time side by side, and stays silent
+    /// rather than inventing a conversion.
+    let meetingZoneLabel: String?
 
     /// Board rule (Lazy `_on_mail_message`): school OR time-sensitive OR event.
     var shouldBoard: Bool { isSchool || isTimeSensitive || hasEvent }
@@ -281,6 +288,13 @@ enum MailClassifier {
         let eventCues = eventPatterns.contains { matches($0.regex, in: body) }
         let hasEvent = eventCues && meeting.date != nil
         let urgencyResult = urgency(in: subject + "\n" + body)
+        // M4.5c: a zone written beside the time means those components belong
+        // to the MAIL's zone, not the user's — resolve the instant there and
+        // remember the label for the card. If the id can't be resolved, fall
+        // back to local and show no label rather than claim a conversion we
+        // didn't make.
+        let zoneMatch = extractTimezone(text: body)
+        let sourceZone = zoneMatch.flatMap { TimeZone(identifier: $0.zoneID) }
         return MailClassification(
             isSchool: school.isSchool,
             schoolReason: school.reason,
@@ -290,7 +304,8 @@ enum MailClassifier {
             urgencyConfidence: urgencyResult.confidence,
             urgencyReasons: urgencyResult.reasons,
             meeting: meeting,
-            meetingStart: eventStart(in: body, hasEvent: hasEvent, now: now)
+            meetingStart: eventStart(in: body, hasEvent: hasEvent, now: now, sourceZone: sourceZone),
+            meetingZoneLabel: sourceZone == nil ? nil : zoneMatch?.label
         )
     }
 
@@ -305,13 +320,17 @@ enum MailClassifier {
     /// mail is IGNORED — Lazy's regexes never captured one); 12h time
     /// first, then `at HH:MM` 24h; no time → 00:00. `extract_meeting_details`
     /// never fed this — its date/time strings remain display-only.
-    static func eventStart(in body: String, hasEvent: Bool, now: Date) -> Date? {
+    static func eventStart(in body: String, hasEvent: Bool, now: Date, sourceZone: TimeZone? = nil) -> Date? {
         guard hasEvent else { return nil }
         guard let datePart = extractStartDate(text: body, now: now) else { return nil }
         let timePart = extractStartTime(text: body) ?? "00:00"
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
+        // M4.5c: when the mail states its own zone ("4:15 PM ET") the parsed
+        // components belong to THAT zone — materialising them in `.current`
+        // stamped a US school's meeting time as the user's own and fired the
+        // banner hours late. No zone written → local, exactly as Lazy did.
+        formatter.timeZone = sourceZone ?? .current
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
         guard let start = formatter.date(from: "\(datePart)T\(timePart)") else { return nil }
         // Clicky-only guard Lazy never needed: Lazy returned early on
@@ -321,6 +340,86 @@ enum MailClassifier {
         // banner flood at connect instead of at the meeting itself.
         guard start > now else { return nil }
         return start
+    }
+
+    // MARK: - Mail-stated timezone (M4.5c)
+
+    /// Zone tokens, most specific first. Every code is case-insensitive
+    /// ("4:15pm est" is common in real mail) and MUST sit directly after a
+    /// clock time — `looksLikeTime` is strict about that, so a stray acronym
+    /// or a URL elsewhere in the mail can never be mistaken for one.
+    private static let zoneTokens: [(pattern: String, label: String, zoneID: String)] = [
+        ( #"\beastern (?:standard |daylight )?time\b"#, "ET", "America/New_York" ),
+        ( #"\bcentral (?:standard |daylight )?time\b"#, "CT", "America/Chicago" ),
+        ( #"\bmountain (?:standard |daylight )?time\b"#, "MT", "America/Denver" ),
+        ( #"\bpacific (?:standard |daylight )?time\b"#, "PT", "America/Los_Angeles" ),
+        ( #"\bgreenwich (?:mean |standard )?time\b"#, "GMT", "UTC" ),
+        ( #"\bET\b"#, "ET", "America/New_York" ),
+        ( #"\bEST\b"#, "ET", "America/New_York" ),
+        ( #"\bEDT\b"#, "ET", "America/New_York" ),
+        ( #"\bCT\b"#, "CT", "America/Chicago" ),
+        ( #"\bCST\b"#, "CT", "America/Chicago" ),
+        ( #"\bCDT\b"#, "CT", "America/Chicago" ),
+        ( #"\bMT\b"#, "MT", "America/Denver" ),
+        ( #"\bMST\b"#, "MT", "America/Denver" ),
+        ( #"\bMDT\b"#, "MT", "America/Denver" ),
+        ( #"\bPT\b"#, "PT", "America/Los_Angeles" ),
+        ( #"\bPST\b"#, "PT", "America/Los_Angeles" ),
+        ( #"\bPDT\b"#, "PT", "America/Los_Angeles" ),
+        ( #"\bUTC\b"#, "UTC", "UTC" ),
+        ( #"\bGMT\b"#, "GMT", "UTC" ),
+        ( #"\bBST\b"#, "BST", "Europe/London" ),
+        ( #"\bWAT\b"#, "WAT", "Africa/Lagos" )
+    ]
+
+    /// Compiled once at first use, not per call (M4.5d): the freeze fix. The
+    /// first version compiled all 21 patterns inside `extractTimezone`, i.e.
+    /// 21 NSRegularExpression compilations + full-body scans on the MAIN
+    /// thread for every synced message — one large mail body could beachball
+    /// the app mid-question. Same patterns, same order, same results.
+    private static let compiledZoneTokens: [(regex: NSRegularExpression, label: String, zoneID: String)] =
+        zoneTokens.compactMap { token in
+            guard let regex = try? NSRegularExpression(pattern: token.pattern, options: [.caseInsensitive]) else { return nil }
+            return (regex, token.label, token.zoneID)
+        }
+
+    /// M4.5c — an explicit timezone written beside a meeting time. Returns the
+    /// short label for display plus the zone to materialise the instant in.
+    static func extractTimezone(text: String) -> (label: String, zoneID: String)? {
+        for token in compiledZoneTokens {
+            let regex = token.regex
+            for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                guard let matchRange = Range(match.range, in: text) else { continue }
+                let beforeZone = text[text.startIndex..<matchRange.lowerBound]
+                let lookback = beforeZone.count > 16 ? String(beforeZone.suffix(16)) : String(beforeZone)
+                if looksLikeTime(lookback) {
+                    return (token.label, token.zoneID)
+                }
+            }
+        }
+        return nil
+    }
+
+    private static let timeTokenRegex = try? NSRegularExpression(
+        pattern: #"^\d{1,2}[:.]\d{2}(?:\s*[ap]\.?m\.?)?$|^\d{1,2}\s*[ap]\.?m\.?$"#,
+        options: [.caseInsensitive]
+    )
+
+    /// The trailing words before the zone token must BE a clock time
+    /// ("4:15 pm", "16:15", "4pm"). Deliberately strict: the naive "has a
+    /// digit and a colon" test would let a URL (".../2026/est") or a date be
+    /// read as a timezone and corrupt the parse Lazy's harness verified.
+    private static func looksLikeTime(_ snippet: String) -> Bool {
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Drop trailing punctuation so "4:15 pm," still reads as a time.
+        let stripped = String(trimmed.reversed().drop(while: { !$0.isLetter && !$0.isNumber }).reversed())
+        let tokens = stripped.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard let lastToken = tokens.last else { return false }
+        // "…at 4:15 pm" → the time spans the last two tokens; "…at 16:15" → one.
+        return [tokens.suffix(2).joined(separator: " "), lastToken].contains { candidate in
+            guard let regex = timeTokenRegex else { return false }
+            return regex.firstMatch(in: candidate, range: NSRange(candidate.startIndex..., in: candidate)) != nil
+        }
     }
 
     private static let weekdayNumbers: [String: Int] = [
