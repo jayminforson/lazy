@@ -29,7 +29,7 @@ Lazy is an independent, free reimplementation **inspired by [HeyClicky]**, the p
 
 ```sh
 git clone <this repo>
-open Clicky.xcodeproj   # then press Cmd+R in Xcode
+open Lazy.xcodeproj   # then press Cmd+R in Xcode
 ```
 
 Optional — install the Gemini key (keeps it out of the repo, `600` perms):
