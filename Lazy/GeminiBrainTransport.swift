@@ -229,6 +229,7 @@ final class GeminiBrainTransport {
         )
 
         print("🧠 Gemini direct: model=\(primaryModelID), \(images.count) image(s), history=\(conversationHistoryMessages.count)")
+        BrainLog.line("gemini: model=\(primaryModelID), \(images.count) image(s), history=\(conversationHistoryMessages.count)")
 
         let brainStartedAt = ProcessInfo.processInfo.systemUptime
         var passMessages = messages
@@ -254,6 +255,7 @@ final class GeminiBrainTransport {
             if let note {
                 searchedAhead = true
                 print("⏱ WebSearch: \(searchMilliseconds)ms (proactive) — answering in one model pass")
+                BrainLog.line("websearch: \(searchMilliseconds)ms (proactive) — answering in one model pass")
                 partText = note
             } else {
                 // M4.5d — one search attempt per turn, and an honest one: the
@@ -261,7 +263,7 @@ final class GeminiBrainTransport {
                 // guess (fabricated match times were the drill's worst
                 // output) or pointed at a hook it must not use again.
                 print("⏱ WebSearch: \(searchMilliseconds)ms — search unavailable, telling the model not to guess")
-                BrainLog.line("websearch: proactive search unavailable for \"\(hint.prefix(60))\" — honest note appended")
+                BrainLog.line("websearch: \(searchMilliseconds)ms — search unavailable for \"\(hint.prefix(60))\" — honest note appended")
                 partText = Self.searchUnavailableNote
             }
             // Fold the note into the user turn as one more text part — the
@@ -305,6 +307,7 @@ final class GeminiBrainTransport {
                 // Rate limit fires before any content delta streams (no
                 // partial speech to unwind) — demote and retry once.
                 print("⚠️ Gemini direct: \(passModelID) rate-limited — demoting to \(Self.fallbackModelID)")
+                BrainLog.line("pass: \(passModelID) rate-limited (429) — retrying on \(Self.fallbackModelID)")
                 LazyAnalytics.trackResponseError(error: "gemini-demote: \(passModelID) 429")
                 isRunningOnFallbackModel = true
                 return try await streamCompletion(
@@ -630,10 +633,18 @@ final class GeminiBrainTransport {
            Self.extractStrictSearchMarker(from: accumulatedReplyText) == nil {
             sentenceStreamer.appendDelta(heldBackText)
         }
+        let passTTFTMilliseconds = firstDeltaAt.map { Int(($0 - passStartedAt) * 1000) } ?? -1
+        let passTotalMilliseconds = Int((ProcessInfo.processInfo.systemUptime - passStartedAt) * 1000)
         print(String(
             format: "⏱ Gemini pass: ttft=%dms total=%dms",
-            firstDeltaAt.map { Int(($0 - passStartedAt) * 1000) } ?? -1,
-            Int((ProcessInfo.processInfo.systemUptime - passStartedAt) * 1000)
+            passTTFTMilliseconds,
+            passTotalMilliseconds
+        ))
+        BrainLog.line(String(
+            format: "pass: model=%@ ttft=%dms total=%dms",
+            modelID,
+            passTTFTMilliseconds,
+            passTotalMilliseconds
         ))
         return accumulatedReplyText
     }

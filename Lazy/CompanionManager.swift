@@ -89,6 +89,7 @@ enum LazyLatency {
         lastMarkedAt = interactionStartedAt
         didMarkFirstTTSPaudio = false
         print("[latency] ————— new interaction —————")
+        BrainLog.line("latency: ————— new interaction —————")
     }
 
     static func mark(_ label: String) {
@@ -97,6 +98,7 @@ enum LazyLatency {
         let totalMilliseconds = Int((now - startedAt) * 1000)
         let deltaMilliseconds = Int((now - (lastMarkedAt ?? startedAt)) * 1000)
         print("[latency] \(label): +\(totalMilliseconds)ms total, +\(deltaMilliseconds)ms since previous")
+        BrainLog.line("latency: \(label): +\(totalMilliseconds)ms total, +\(deltaMilliseconds)ms since previous")
         lastMarkedAt = now
     }
 
@@ -1592,6 +1594,7 @@ final class CompanionManager: ObservableObject {
                         // so the next chain link isn't spoken on top of them.
                         elevenLabsTTSClient.stopPlayback()
                         print("⚠️ Gemini direct brain failed, falling back to local bridge: \(error)")
+                        BrainLog.line("chain: Gemini direct failed (\(error)) — falling back to local serve (slower link)")
                         LazyAnalytics.trackResponseError(error: "gemini: \(error.localizedDescription)")
                     }
                 }
@@ -1630,6 +1633,7 @@ final class CompanionManager: ObservableObject {
                         // unavailable), fall back to the Cloudflare worker chat
                         // route so interactions still get an answer.
                         print("⚠️ OpenCode bridge failed, falling back to worker chat: \(error)")
+                        BrainLog.line("chain: local serve failed (\(error)) — falling back to Cloudflare worker")
                         LazyAnalytics.trackResponseError(error: "bridge: \(error.localizedDescription)")
                         didFailOverToWorker = true
 
