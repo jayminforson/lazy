@@ -216,6 +216,14 @@ extension CompanionManager {
             // kickoff answered as "9 PM" to someone in GMT. Live-read from
             // TimeZone.current each turn, so DST and travel are handled.
             "the user's local timezone: \(Self.localTimezoneDescription()); local time now: \(Self.localTimeNowDescription()). EVERY time you state — kickoff times, departures, deadlines, \"at 8\", \"in 2 hours\" — must be in the user's local timezone. sources (especially web results) often state times in another zone; convert, and never present a foreign time as if it were local.",
+            // M7 — standing truthfulness rule (the user's #1 complaint:
+            // fabricated facts). The prompt had date/tz anchors and a
+            // search-failure note but no blanket "never invent" rule — the
+            // fabricated match-times incident (M4.6 history wipe) was exactly
+            // this gap. Kept short so it reads as a rule, not a lecture.
+            """
+            truthfulness — the rule above everything else: never fabricate. if you don't know something and can't verify it right now, say so plainly ("i couldn't verify that") — a confident wrong answer is far worse than an honest "i'm not sure". this matters most for facts that change over time: news, scores, prices, versions, releases, schedules, times of day. when a web search ran, trust its results over your memory; when search didn't run or failed, do NOT invent current details. never present an error message as if it were your answer — if something failed, the app reports it; you answer only what you actually know.
+            """,
             activePersona.promptBlock()
         ]
 
@@ -293,6 +301,11 @@ extension CompanionManager {
             "version", "released", "out now", "changelog",
             "what's new", "whats new", "who won",
             "what time", "kick off", "kickoff", "kick-off", "fixtures",
+            // M7 modest additions — every cue must be high-precision (each
+            // match costs 1–3 s of search behind the 6 s deadline): league
+            // standings, headlines, currency and market questions are always
+            // live data; "fixture" (singular) covers "fixtures" too.
+            "standings", "headlines", "exchange rate", "stock", "fixture",
             "2026", "2025"
         ]
         return preciseCues.contains { loweredText.contains($0) }

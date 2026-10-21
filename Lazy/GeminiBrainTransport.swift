@@ -16,7 +16,9 @@ import Foundation
 ///   2. UserDefaults `clickyGeminiAPIKey`
 ///
 /// On 429 the transport demotes the smart model to the fast model once and
-/// retries before giving up to the next chain link.
+/// retries before giving up to the next chain link; M7 adds one same-model
+/// retry on transient server failures (500/502/503/504/529) so a Google
+/// blip can't silently hand the turn to a fallback brain.
 @MainActor
 final class GeminiBrainTransport {
 
@@ -28,15 +30,24 @@ final class GeminiBrainTransport {
     static let chatCompletionsEndpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
     /// Semantic picker choices (same "fast"/"smart" keys the panel stores)
-    /// mapped to free-tier Gemini model IDs. Neither is a reasoning model —
-    /// parity with the old OpenCode mapping (low time-to-first-word).
+    /// mapped to free-tier Gemini model IDs. M7 brain-smartness retier:
+    /// "fast" (the everyday default tier) climbs from gemini-3.5-flash-lite
+    /// to gemini-3.6-flash — two model generations of reasoning for the same
+    /// free tier — and "smart" moves to gemini-3.8-flash, probe-gated at
+    /// build time (3×200 + a reasoning sanity check on the day the map was
+    /// written; free-tier speed swings 1.4–14 s for the same model, so the
+    /// gate checks health, not latency). Both models may think invisibly
+    /// before speaking (3.8's thinking consumed a 32-token probe budget);
+    /// the app sends no max_tokens cap, so thinking always gets room.
+    /// The chosen mapping prints at launch (`🧠 Gemini direct: enabled …`).
     private static let modelIDBySemanticChoice: [String: String] = [
-        "fast": "gemini-3.5-flash-lite",
-        "smart": "gemini-3.6-flash"
+        "fast": "gemini-3.6-flash",
+        "smart": "gemini-3.8-flash"
     ]
 
-    /// Rate-limit demotion target — always the fast/cheap model.
-    private static let fallbackModelID = "gemini-3.5-flash-lite"
+    /// Rate-limit demotion target — the fast model (gemini-3.6-flash since
+    /// M7; a demoted turn still gets a generation-newer brain than before).
+    private static let fallbackModelID = "gemini-3.6-flash"
 
     /// Per-request timeout. Multi-monitor screenshots are large and the
     /// smart model can reason for a while before its first delta.
@@ -52,6 +63,12 @@ final class GeminiBrainTransport {
     /// Cap on persisted messages (user + assistant turns, always stored in
     /// pairs). Oldest pairs drop off first so prefill stays bounded forever.
     private static let maximumHistoryMessageCount = 60
+
+    /// M7 byte budget on the same history — the count cap alone let 60 long
+    /// messages reach 54 KB of replayed context (stale wrong answers the
+    /// model would imitate, plus prefill bloat on every turn). Oldest pairs
+    /// drop until the encoded history fits.
+    private static let maximumHistoryByteCount = 14 * 1024
 
     /// Application Support subdirectory + file that holds the API key
     /// (chmod 600 by convention — file permissions are the user's to set).
@@ -507,7 +524,46 @@ final class GeminiBrainTransport {
 
     // MARK: - Streaming
 
+    /// M7 — one bounded same-model retry on transient Google failures
+    /// (500/502/503/504/529 — real 503s hit the build-time probes). Without
+    /// it any blip failed the whole Gemini link to the serve fallback, which
+    /// silently swaps the user's brain mid-conversation. Retry-safe by
+    /// construction: a transient status throws at the status check, before
+    /// ANY delta reaches the sentence streamer, so nothing can double-speak.
+    /// 429 keeps its own demote path; mid-stream errors never retry (text
+    /// may already have been spoken).
     private func streamCompletion(
+        modelID: String,
+        messages: [[String: Any]],
+        sentenceStreamer: OpenCodeChatClient.SentenceStreamer
+    ) async throws -> String {
+        do {
+            return try await streamCompletionOnce(
+                modelID: modelID,
+                messages: messages,
+                sentenceStreamer: sentenceStreamer
+            )
+        } catch TransportError.httpFailure(let statusCode, _)
+            where Self.isTransientStatusCode(statusCode) {
+            BrainLog.line("⚠️ Gemini pass: HTTP \(statusCode) — transient, retrying once in 1.5s (\(modelID))")
+            print("⚠️ Gemini: transient HTTP \(statusCode) on \(modelID) — retrying once")
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            if Task.isCancelled { throw CancellationError() }
+            return try await streamCompletionOnce(
+                modelID: modelID,
+                messages: messages,
+                sentenceStreamer: sentenceStreamer
+            )
+        }
+    }
+
+    /// Transient server-side statuses worth one retry (not 429 — that one
+    /// demotes, and not 4xx client errors, which would fail identically).
+    private static func isTransientStatusCode(_ statusCode: Int) -> Bool {
+        [500, 502, 503, 504, 529].contains(statusCode)
+    }
+
+    private func streamCompletionOnce(
         modelID: String,
         messages: [[String: Any]],
         sentenceStreamer: OpenCodeChatClient.SentenceStreamer
@@ -660,7 +716,18 @@ final class GeminiBrainTransport {
         while conversationHistoryMessages.count > Self.maximumHistoryMessageCount {
             conversationHistoryMessages.removeFirst(2)
         }
+        // M7 — the byte budget applies alongside the count cap: 60 long
+        // messages were still 54 KB of replayed context. Drop oldest pairs
+        // until the encoded history fits (one small encode per turn).
+        while conversationHistoryMessages.count > 2,
+              Self.encodedByteCount(of: conversationHistoryMessages) > Self.maximumHistoryByteCount {
+            conversationHistoryMessages.removeFirst(2)
+        }
         persistHistory()
+    }
+
+    private static func encodedByteCount(of history: [ConversationHistoryMessage]) -> Int {
+        (try? JSONEncoder().encode(history))?.count ?? 0
     }
 
     private func persistHistory() {
@@ -676,6 +743,12 @@ final class GeminiBrainTransport {
         // A crash could have left an unpaired tail — drop it so pairs stay aligned.
         if decodedHistory.count % 2 != 0 {
             decodedHistory.removeLast()
+        }
+        // M7 — the byte budget also applies at load, so an oversized blob
+        // written by an older build is trimmed on launch, not next exchange.
+        while decodedHistory.count > 2,
+              encodedByteCount(of: decodedHistory) > maximumHistoryByteCount {
+            decodedHistory.removeFirst(2)
         }
         return decodedHistory
     }
