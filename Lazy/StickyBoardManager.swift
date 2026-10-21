@@ -573,8 +573,10 @@ private let flashColor = Color(red: 253.0 / 255.0, green: 223.0 / 255.0, blue: 1
 struct StickyBoardView: View {
     @ObservedObject var manager: StickyBoardManager
 
-    @State private var hoverItemID: String?
-    @State private var strikeProgress: [String: Double] = [:]
+    // M4.5e: hover + strike state moved OUT of here into StickyRowView —
+    // as root @State they made every ✕ hover (or strike tick) re-evaluate
+    // all rows plus paper/tape/shadows, which is why hovering a note
+    // stuttered the whole board.
     @State private var isDragging = false
 
     // Metrics from Lazy (font_pt = 20): row = pt+20, header = pt+24, add = pt+22.
@@ -670,7 +672,7 @@ struct StickyBoardView: View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(manager.items) { item in
-                    rowView(item)
+                    StickyRowView(manager: manager, item: item, rowHeight: rowHeight, boxSize: boxSize)
                 }
             }
             .padding(.top, 10)
@@ -682,14 +684,59 @@ struct StickyBoardView: View {
         }
     }
 
-    @ViewBuilder
-    private func rowView(_ item: StickyItem) -> some View {
-        let progress = strikeProgress[item.id] ?? (item.done ? 1.0 : 0.0)
+    // MARK: Add band
+
+    private var addBand: some View {
+        HStack(spacing: 6) {
+            Text("+ add something…")
+                .font(StickyBoardManager.handFont(20))
+                .foregroundColor(pencilSoftColor)
+            Spacer()
+        }
+        .frame(height: addHeight)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Lazy: clicking anywhere on the add band opens the Add dialog.
+            manager.promptAdd()
+        }
+    }
+}
+
+// MARK: - Row view
+
+/// One board row, its own @State (M4.5e). Hover ✕ and the strike animation
+/// used to live on `StickyBoardView` as root state, so hovering one ✕ (or
+/// the 0.26 s strike tick) re-evaluated EVERY row plus the paper/tape/
+/// shadow layers — the sticky-note half of the freeze. Scoped to a single
+/// row, a hover re-renders this row and nothing else.
+private struct StickyRowView: View {
+    @ObservedObject var manager: StickyBoardManager
+    let item: StickyItem
+    let rowHeight: CGFloat
+    let boxSize: CGFloat
+
+    @State private var isHovered = false
+    @State private var strikeProgress: Double
+
+    init(manager: StickyBoardManager, item: StickyItem, rowHeight: CGFloat, boxSize: CGFloat) {
+        self.manager = manager
+        self.item = item
+        self.rowHeight = rowHeight
+        self.boxSize = boxSize
+        // Mirrors the old root-dict fallback: no strike state yet → done
+        // items render crossed from the start (Lazy's done-session), open
+        // items clean.
+        _strikeProgress = State(initialValue: item.done ? 1.0 : 0.0)
+    }
+
+    var body: some View {
+        let progress = strikeProgress
         HStack(spacing: 0) {
             ZStack {
-                WobblyCheckbox(jitter: jitter(for: item))
+                WobblyCheckbox(jitter: jitter)
                 if progress >= 0.99 {
-                    HandCheckmark(jitter: jitter(for: item))
+                    HandCheckmark(jitter: jitter)
                 }
             }
             .frame(width: boxSize + 6, height: rowHeight)
@@ -698,7 +745,7 @@ struct StickyBoardView: View {
                 // Lazy: checkbox zone click crosses the item out (0.26 s
                 // pencil strike, OutCubic) and persists the state.
                 withAnimation(.easeOut(duration: 0.26)) {
-                    strikeProgress[item.id] = item.done ? 0.0 : 1.0
+                    strikeProgress = item.done ? 0.0 : 1.0
                 }
                 manager.toggleDone(item)
             }
@@ -711,7 +758,7 @@ struct StickyBoardView: View {
                     .truncationMode(.tail)
                     .overlay(alignment: .leading) {
                         if progress > 0 {
-                            PencilStrikeShape(progress: progress, jitter: jitter(for: item))
+                            PencilStrikeShape(progress: progress, jitter: jitter)
                                 .stroke(
                                     pencilSoftColor,
                                     style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
@@ -732,7 +779,7 @@ struct StickyBoardView: View {
                 manager.openPopup(for: item)
             }
 
-            removeButton(item)
+            removeButton
         }
         .frame(height: rowHeight)
         .background {
@@ -753,9 +800,8 @@ struct StickyBoardView: View {
         }
     }
 
-    private func removeButton(_ item: StickyItem) -> some View {
-        let isHovered = hoverItemID == item.id
-        return Button {
+    private var removeButton: some View {
+        Button {
             manager.delete(item)
         } label: {
             Canvas { context, _ in
@@ -773,31 +819,11 @@ struct StickyBoardView: View {
             .frame(width: 14, height: 14)
         }
         .buttonStyle(.plain)
-        .onHover { hoverItemID = $0 ? item.id : nil }
+        .onHover { isHovered = $0 }
     }
-
-    // MARK: Add band
-
-    private var addBand: some View {
-        HStack(spacing: 6) {
-            Text("+ add something…")
-                .font(StickyBoardManager.handFont(20))
-                .foregroundColor(pencilSoftColor)
-            Spacer()
-        }
-        .frame(height: addHeight)
-        .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            // Lazy: clicking anywhere on the add band opens the Add dialog.
-            manager.promptAdd()
-        }
-    }
-
-    // MARK: Helpers
 
     /// Deterministic per-item wobble (Lazy seeded a RNG with the key).
-    private func jitter(for item: StickyItem) -> Double {
+    private var jitter: Double {
         var hash: UInt64 = 5381
         for byte in item.id.utf8 {
             hash = hash &* 33 &+ UInt64(byte)

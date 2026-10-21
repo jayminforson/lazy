@@ -1040,11 +1040,27 @@ class OverlayWindowManager {
     var hasShownOverlayBefore = false
 
     func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
+        let isFirstAppearance = !hasShownOverlayBefore
+
+        // M4.5e: already up on exactly these screens and this is not the
+        // onboarding (welcome) rebuild → nothing to do. Every call site
+        // used to tear down ALL full-screen hosting views and recreate
+        // them per screen; that churn is main-thread work happening at
+        // whatever moment the interaction needed responsiveness, and the
+        // welcome paths (triggerOnboarding / replayOnboarding) clear
+        // hasShownOverlayBefore first, so isFirstAppearance stays true
+        // there and their rebuild still runs.
+        if !isFirstAppearance,
+           overlayWindows.count == screens.count,
+           screens.allSatisfy({ screen in overlayWindows.contains(where: { $0.frame == screen.frame }) }),
+           overlayWindows.allSatisfy({ $0.isVisible }) {
+            return
+        }
+
         // Hide any existing overlays
         hideOverlay()
 
         // Track if this is the first time showing overlay (welcome message)
-        let isFirstAppearance = !hasShownOverlayBefore
         hasShownOverlayBefore = true
 
         // Create one overlay window per screen
