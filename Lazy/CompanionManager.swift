@@ -229,7 +229,9 @@ final class CompanionManager: ObservableObject {
     /// Primary brain transport #1: Gemini free tier called directly (skipped
     /// entirely when no API key is configured). The local OpenCode bridge
     /// above stays attempt #2 and the worker claudeAPI attempt #3.
-    private let geminiBrainTransport = GeminiBrainTransport()
+    /// Internal (not private) since M8: +Conversations activates the
+    /// per-conversation brain history on open/create/delete (M2 access rule).
+    let geminiBrainTransport = GeminiBrainTransport()
 
     lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         let client = ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
@@ -241,7 +243,9 @@ final class CompanionManager: ObservableObject {
 
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
-    private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
+    /// Internal since M8: +Conversations clears/rebuilds it on conversation
+    /// switches so the serve fallback never bleeds context between chats.
+    var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
 
     // MARK: - Chat Window State (typed messages)
 
@@ -287,9 +291,38 @@ final class CompanionManager: ObservableObject {
         var promptText: String
     }
 
-    /// Persisted transcript shown in the chat window. Loaded at startup so
-    /// history survives app restarts.
-    @Published private(set) var chatMessages: [ChatMessage] = []
+    // MARK: - Conversations (M8)
+
+    /// All persisted chats — the Recents source of truth. Internal setter:
+    /// `CompanionManager+Conversations` owns every mutation (M2 access rule).
+    @Published var conversations: [ChatConversation] = []
+
+    /// The conversation the sheet shows — nil = fresh draft (empty chat,
+    /// empty brain memory). Set by beginFreshChat / openConversation /
+    /// createConversation; cleared by beginFreshChat on every sheet open.
+    @Published var activeConversationID: UUID?
+
+    /// The conversation the in-flight (or most recent) respond() turn owns.
+    /// Appends route here first, so a reply keeps landing in the chat that
+    /// asked it even if the sheet reopens fresh mid-stream; cleared when
+    /// idle as conversations are switched (see openConversation).
+    var currentTurnConversationID: UUID?
+
+    /// The active conversation's transcript — computed so every reader
+    /// follows a conversation switch for free (`conversations` is the
+    /// published source of truth; this was a @Published array before M8).
+    /// Empty = fresh draft → ChatView's existing empty state.
+    var chatMessages: [ChatMessage] { activeConversation?.messages ?? [] }
+
+    /// Active-conversation lookup shared with +Conversations.
+    var activeConversation: ChatConversation? { conversations.first { $0.id == activeConversationID } }
+
+    /// M8 — a reply is streaming RIGHT NOW (typed bubble live, or voice in
+    /// processing/responding). Conversation switches keep turn ownership
+    /// while this is true so an in-flight reply can't be mis-routed —
+    /// `currentResponseTask` can't serve as the signal: it keeps holding
+    /// the FINISHED task after every turn (only stop() nils it).
+    var isTurnInFlight: Bool { chatIsResponding || voiceState != .idle }
 
     /// True while a typed reply is streaming — drives the typing indicator
     /// and the live-updating assistant bubble in the chat window.
@@ -328,10 +361,20 @@ final class CompanionManager: ObservableObject {
         activePersonaID = id
         UserDefaults.standard.set(id, forKey: Self.activePersonaDefaultsKey)
         print("🎭 Persona: \(id)")
+        // M7.1 — the tier lock is a behavior change, so name it once per
+        // switch instead of silently routing Smart requests to fast.
+        if id == LazyPersona.pipID {
+            BrainLog.line("🎛 persona: Pip active — brain locked to the fast tier by design")
+        } else {
+            BrainLog.line("🎛 persona: \(LazyPersona.persona(id: id).name) active")
+        }
     }
 
-    private static let persistedChatMessagesKey = "clickyChatMessages"
-    private static let maximumPersistedChatMessageCount = 100
+    // M8 — the conversation store key lives in +Conversations
+    // (`persistedConversationsKey`); the old `clickyChatMessages` key is
+    // read once by the migration and removed. Per-conversation transcript
+    // cap — internal: +Conversations enforces it on every append.
+    static let maximumPersistedChatMessageCount = 100
 
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
@@ -412,6 +455,15 @@ final class CompanionManager: ObservableObject {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAPI.model = Self.fallbackWorkerModelID(forSemanticModelChoice: model)
+    }
+
+    /// M7.1 — Pip's identity is speed: with Pip active the brain always
+    /// runs the fast tier, even when Smart is selected in Settings (the
+    /// hero card says "runs fast by design" so it's never mysterious).
+    /// Every chain link receives this effective choice, so Gemini, the
+    /// serve bridge and the worker fallback all stay consistent.
+    var effectiveSemanticModelChoice: String {
+        activePersonaID == LazyPersona.pipID ? "fast" : selectedModel
     }
 
     /// Model ID sent to the Cloudflare worker chat route (the fallback brain).
@@ -543,8 +595,10 @@ final class CompanionManager: ObservableObject {
         // first voice interaction doesn't pay for cold preflight round trips.
         openCodeChatClient.warmUp()
 
-        // Restore the chat window transcript from the previous run.
-        loadPersistedChatMessages()
+        // M8 — restore the conversation store (each chat keeps its own
+        // transcript); the sheet still opens on a fresh chat (beginFreshChat
+        // at openSheet) with past chats behind the Recents toggle.
+        loadConversations()
 
         // B2: fill any missing bundled skill files in Application Support
         // (first launch writes all 38; later launches only fill gaps, so
@@ -1204,6 +1258,17 @@ final class CompanionManager: ObservableObject {
             }
         }
 
+        // M8 — every turn owns a conversation: a fresh draft (nil active)
+        // materializes here, titled from the first message — voice turns get
+        // their title here too, since their transcript is intentionally
+        // never written. Every append below routes through
+        // currentTurnConversationID, so a reply keeps landing in the chat
+        // that asked it even if the sheet is reopened fresh mid-stream.
+        if activeConversationID == nil {
+            createConversation(titledFrom: userMessageText)
+        }
+        currentTurnConversationID = activeConversationID
+
         currentResponseTask = Task {
             if speakReply {
                 // Stay in processing (spinner) state — voice gets no on-screen
@@ -1568,7 +1633,7 @@ final class CompanionManager: ObservableObject {
                         let streamedReply = try await geminiBrainTransport.analyzeScreenshots(
                             images: labeledImages,
                             systemPrompt: companionSystemPrompt,
-                            semanticModelChoice: selectedModel,
+                            semanticModelChoice: effectiveSemanticModelChoice,
                             userPrompt: brainUserPrompt,
                             conversationSeed: conversationSeedForNewSession(),
                             // M4.5b: the raw utterance, not brainUserPrompt — that
@@ -1604,7 +1669,7 @@ final class CompanionManager: ObservableObject {
                         let streamedReply = try await openCodeChatClient.analyzeScreenshots(
                             images: labeledImages,
                             systemPrompt: companionSystemPrompt,
-                            semanticModelChoice: selectedModel,
+                            semanticModelChoice: effectiveSemanticModelChoice,
                             userPrompt: brainUserPrompt,
                             // Only consumed when the client just rotated to a
                             // fresh session (it has no server-side memory then).
@@ -1718,7 +1783,13 @@ final class CompanionManager: ObservableObject {
                     )
                     return
                 }
-                if let runGoal = agentRunGoal ?? computerUseGoal, RiskGate.isRiskyRunGoal(runGoal) {
+                // M7.1 — Sable checks twice: with Sable active EVERY run
+                // goal parks for a yes/no (on top of the risky cues below).
+                // The parked payload's answer path executes the run exactly
+                // like any other confirmation, so no new execution code.
+                let sableWantsRunConfirmation = activePersonaID == LazyPersona.sableID
+                if let runGoal = agentRunGoal ?? computerUseGoal,
+                   RiskGate.isRiskyRunGoal(runGoal) || sableWantsRunConfirmation {
                     elevenLabsTTSClient.stopPlayback()
                     let riskGatePlanText = spokenText.trimmingCharacters(in: .whitespacesAndNewlines)
                     await parkRiskConfirmation(
@@ -1729,7 +1800,9 @@ final class CompanionManager: ObservableObject {
                             userMessageText: userMessageText,
                             source: source
                         ),
-                        question: RiskGate.confirmationQuestion(forRunGoal: runGoal),
+                        question: sableWantsRunConfirmation && !RiskGate.isRiskyRunGoal(runGoal)
+                            ? "This will run commands or make changes on your Mac. Should I go ahead?"
+                            : RiskGate.confirmationQuestion(forRunGoal: runGoal),
                         typedPlanText: riskGatePlanText,
                         speakReply: speakReply
                     )
@@ -2032,27 +2105,6 @@ final class CompanionManager: ObservableObject {
         respond(to: trimmedMessageText, source: .typed, fileAttachments: fileAttachments)
     }
 
-    private func appendChatMessage(role: ChatMessageRole, text: String) {
-        chatMessages.append(ChatMessage(id: UUID(), role: role, text: text, sentAt: Date()))
-        if chatMessages.count > Self.maximumPersistedChatMessageCount {
-            chatMessages.removeFirst(chatMessages.count - Self.maximumPersistedChatMessageCount)
-        }
-        persistChatMessages()
-    }
-
-    private func persistChatMessages() {
-        guard let encodedMessages = try? JSONEncoder().encode(chatMessages) else { return }
-        UserDefaults.standard.set(encodedMessages, forKey: Self.persistedChatMessagesKey)
-    }
-
-    private func loadPersistedChatMessages() {
-        guard let encodedMessages = UserDefaults.standard.data(forKey: Self.persistedChatMessagesKey),
-              let decodedMessages = try? JSONDecoder().decode([ChatMessage].self, from: encodedMessages) else {
-            return
-        }
-        chatMessages = decodedMessages
-    }
-
     // MARK: - Scheduled Suggestion Delivery (M3)
 
     /// A morning-batch delivery (ReplySource.scheduled): announcement only —
@@ -2144,6 +2196,13 @@ final class CompanionManager: ObservableObject {
     /// system voice — set by the queue-failure callback and the single-shot
     /// catch paths, reset at the start of every interaction.
     var replyNeedsSystemVoiceFallback = false
+
+    /// M7.1 — the AVSpeechSynthesizer behind `speakViaSystemVoice`. Unlike
+    /// the old NSSpeechSynthesizer (which self-retained for the utterance),
+    /// AVSpeech dies with its reference, so the manager holds it — replacing
+    /// it on a new utterance also stops the previous one (latest wins).
+    /// Stored here because extensions can't add stored properties.
+    var systemVoiceSynthesizer: AVSpeechSynthesizer?
 
     // MARK: - Point Tag Parsing
 

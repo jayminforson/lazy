@@ -45,7 +45,13 @@ struct NotchChatSheetView: View {
                 )
             }
 
-            ChatView(companionManager: companionManager, embeddedInNotchSheet: true)
+            // M8 — the Recents toggle swaps the body; the guide/draft cards
+            // above stay visible in both modes (they gate live actions).
+            if notchChatManager.showingRecents {
+                RecentsListView(notchChatManager: notchChatManager, companionManager: companionManager)
+            } else {
+                ChatView(companionManager: companionManager, embeddedInNotchSheet: true)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
@@ -91,6 +97,20 @@ struct NotchChatSheetView: View {
 
             Spacer()
 
+            Button(action: { notchChatManager.showingRecents.toggle() }) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(notchChatManager.showingRecents ? DS.Colors.overlayCursorBlue : DS.Colors.textTertiary)
+                    .frame(width: 24, height: 24)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.white.opacity(notchChatManager.showingRecents ? 0.12 : 0.06))
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .help("Recent chats")
+
             Button(action: onOpenHome) {
                 Image(systemName: "house.fill")
                     .font(.system(size: 11, weight: .medium))
@@ -121,6 +141,150 @@ struct NotchChatSheetView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+}
+
+// MARK: - Recents list
+
+/// M8 — the ChatGPT-style Recents view: past conversations grouped by day
+/// (Today / Yesterday / Previous 7 days / Older), tap to open (transcript
+/// + that chat's brain memory), hover ✕ to delete, "new chat" on top back
+/// to the fresh draft.
+private struct RecentsListView: View {
+    @ObservedObject var notchChatManager: NotchChatManager
+    @ObservedObject var companionManager: CompanionManager
+
+    private var sections: [CompanionManager.RecentsSection] {
+        companionManager.recentsSections()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            newChatRow
+
+            if sections.isEmpty {
+                VStack(spacing: 6) {
+                    Text("no chats yet")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text("past conversations will show up here")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 48)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        ForEach(sections) { section in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(section.title)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .textCase(.uppercase)
+                                    .foregroundColor(DS.Colors.textTertiary)
+                                    .padding(.horizontal, 12)
+                                ForEach(section.items) { item in
+                                    RecentsConversationRow(
+                                        title: item.conversation.title,
+                                        timeText: item.timeText,
+                                        isOpen: item.conversation.id == companionManager.activeConversationID,
+                                        onOpen: {
+                                            companionManager.openConversation(id: item.conversation.id)
+                                            notchChatManager.showingRecents = false
+                                        },
+                                        onDelete: {
+                                            companionManager.deleteConversation(id: item.conversation.id)
+                                        }
+                                    )
+                                    .padding(.horizontal, 12)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 12)
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private var newChatRow: some View {
+        Button {
+            companionManager.beginFreshChat()
+            notchChatManager.showingRecents = false
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 11, weight: .medium))
+                Text("new chat")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+            }
+            .foregroundColor(DS.Colors.textPrimary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .padding(.bottom, 6)
+    }
+}
+
+/// One Recents row — per-row hover state (M4.5e pattern: row-local @State,
+/// not a manager dictionary) so only the hovered row re-renders.
+private struct RecentsConversationRow: View {
+    let title: String
+    let timeText: String
+    let isOpen: Bool
+    let onOpen: () -> Void
+    let onDelete: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: onOpen) {
+                HStack(spacing: 8) {
+                    Text(title.isEmpty ? "New chat" : title)
+                        .font(.system(size: 12, weight: isOpen ? .semibold : .regular))
+                        .foregroundColor(isOpen ? DS.Colors.overlayCursorBlue : DS.Colors.textPrimary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(timeText)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .lineLimit(1)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+
+            if isHovered {
+                Button(action: onDelete) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.red.opacity(0.85))
+                        .frame(width: 18, height: 18)
+                        .background(Circle().fill(Color.white.opacity(0.10)))
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(isOpen ? 0.10 : (isHovered ? 0.08 : 0.04)))
+        )
+        .onHover { isHovered = $0 }
     }
 }
 

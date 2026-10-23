@@ -108,7 +108,7 @@ extension CompanionManager {
             if let directAgentOutcome = try await GeminiAgentToolLoop.run(
                 goal: goal,
                 systemPrompt: Self.agentRunSystemPrompt,
-                semanticModelChoice: selectedModel,
+                semanticModelChoice: effectiveSemanticModelChoice,
                 maximumToolCallCount: Self.maximumAgentRunToolCallCount,
                 maximumDurationInSeconds: Self.maximumAgentRunDurationInSeconds,
                 uiToolHandler: { [weak self] toolName, argumentsJSON in
@@ -137,7 +137,7 @@ extension CompanionManager {
                 agentRunOutcome = try await openCodeChatClient.runAgentTask(
                     goal: goal,
                     systemPrompt: Self.agentRunSystemPrompt,
-                    semanticModelChoice: selectedModel,
+                    semanticModelChoice: effectiveSemanticModelChoice,
                     maximumToolCallCount: Self.maximumAgentRunToolCallCount,
                     maximumDurationInSeconds: Self.maximumAgentRunDurationInSeconds,
                     onToolProgress: { [weak self] progressLine in
@@ -515,7 +515,7 @@ extension CompanionManager {
                     screenshotPixelWidth: cursorScreenCapture.screenshotWidthInPixels,
                     screenshotPixelHeight: cursorScreenCapture.screenshotHeightInPixels,
                     indexedElementLegendText: indexedElementLegendText,
-                    semanticModelChoice: selectedModel
+                    semanticModelChoice: effectiveSemanticModelChoice
                 )
             } catch is CancellationError {
                 outcomeLine = "I stopped the computer-use run — cancelled after \(stepNumber - 1) steps."

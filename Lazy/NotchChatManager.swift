@@ -46,6 +46,11 @@ final class NotchChatManager: ObservableObject {
     /// Published so NotchChatSheetView re-renders and springs.
     @Published private(set) var isSheetOpen = false
 
+    /// M8 — sheet body mode: false = chat (the default fresh draft),
+    /// true = the Recents list. Reset to false on every open (openSheet)
+    /// and on every row/new-chat tap back into a chat.
+    @Published var showingRecents = false
+
     /// Set by the app delegate: opens the Home dashboard. The sheet header's
     /// house button calls through here.
     var onOpenHome: (() -> Void)?
@@ -219,6 +224,10 @@ final class NotchChatManager: ObservableObject {
         repositionPill()
         // Opening the sheet counts as reading — clear the suggestion badge.
         companionManager.proactiveEngine.markAllRead()
+        // M8 — every open lands on a fresh chat: empty transcript, empty
+        // brain memory; past chats live behind the Recents toggle.
+        companionManager.beginFreshChat()
+        showingRecents = false
         guard let targetScreen = screenForNotchChat() else { return }
 
         let fullFrame = sheetFrame(on: targetScreen)

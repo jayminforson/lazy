@@ -122,12 +122,45 @@ extension CompanionManager {
         speakViaSystemVoice(trimmed.isEmpty ? reason : trimmed)
     }
 
-    /// One-shot system-voice playback (NSSpeechSynthesizer self-retains
-    /// for the utterance). Kept in a single function so the macOS 14
-    /// deprecation warnings stay at their baseline count.
+    /// One-shot system-voice playback. Kept in a single function so the
+    /// deprecation-warning budget stays accounted for.
+    /// M7.1 — persona voices landed on AVSpeechSynthesizer (current API;
+    /// the old class's deprecation notes were the file's baseline warnings
+    /// and the persona features would have added three more). M7.2 — the
+    /// user's report "the default voice changed" pinned the cause: AVSpeech's
+    /// nil-voice default (super-compact Samantha here) ≠ the NSSpeech
+    /// built-in default Clicky always had, so the nil-identifier path (Lazy)
+    /// reverts to NSSpeech verbatim and only PINNED persona voices run on
+    /// AVSpeech — Pip reads quicker, Sable measured, Juno steady.
     func speakViaSystemVoice(_ utterance: String) {
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
+        let persona = activePersona
+        // M7.2 — Lazy (no pinned voice) rides the ORIGINAL pre-M7.1 path
+        // verbatim: NSSpeechSynthesizer's built-in default IS the voice the
+        // user knows as Clicky's. AVSpeech's nil-voice default resolves to
+        // the super-compact Samantha family on this machine — audibly
+        // flatter, and the user asked for the old voice back. Pinned
+        // persona voices stay on AVSpeech (their identifiers live there and
+        // resolve, probed: compact.* aliases to super-compact.*).
+        if persona.systemVoiceIdentifier == nil {
+            let synthesizer = NSSpeechSynthesizer()
+            synthesizer.startSpeaking(utterance)
+            LazyLatency.markFirstTTSPaudio()
+            voiceState = .responding
+            return
+        }
+        let synthesizer = AVSpeechSynthesizer()
+        let utteranceObject = AVSpeechUtterance(string: utterance)
+        if let voiceIdentifier = persona.systemVoiceIdentifier {
+            if let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
+                utteranceObject.voice = voice
+            } else {
+                print("🎙 persona voice \(voiceIdentifier) not installed — default voice for \(persona.name)")
+            }
+        }
+        // Persona rate is a delta around AVSpeech's 0.5 default (range 0–1).
+        utteranceObject.rate = min(max(0.5 + persona.systemVoiceRate * 0.5, 0.1), 1.0)
+        systemVoiceSynthesizer = synthesizer
+        synthesizer.speak(utteranceObject)
         LazyLatency.markFirstTTSPaudio()
         voiceState = .responding
     }

@@ -65,7 +65,13 @@ struct ChatView: View {
                             .id(message.id)
                     }
 
-                    if companionManager.chatIsResponding {
+                    // M8 — the live bubble belongs ONLY to the conversation
+                    // whose turn is streaming: a fresh reopen (active nil) or
+                    // a switch to another chat must not display an in-flight
+                    // reply owned by a different conversation — it appends
+                    // there via currentTurnConversationID instead.
+                    if companionManager.chatIsResponding,
+                       companionManager.currentTurnConversationID == companionManager.activeConversationID {
                         streamingAssistantBubble
                             .id(Self.streamingBubbleAnchorID)
                     }
@@ -75,6 +81,11 @@ struct ChatView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: companionManager.chatMessages.count) {
+                scrollToBottom(scrollViewProxy)
+            }
+            .onChange(of: companionManager.activeConversationID) {
+                // M8 — switching conversations (or reopening fresh) moves the
+                // view to the (new) end of the transcript.
                 scrollToBottom(scrollViewProxy)
             }
             .onChange(of: companionManager.chatIsResponding) {

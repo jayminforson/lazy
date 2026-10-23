@@ -200,12 +200,18 @@ final class ElevenLabsTTSClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
 
+        // M7.1 — delivery shaping follows the active persona (the proxy
+        // owns the voice itself; personality rides on stability/similarity).
+        // Lazy's values are byte-identical to the pre-M7.1 constants.
+        let persona = LazyPersona.persona(
+            id: UserDefaults.standard.string(forKey: CompanionManager.activePersonaDefaultsKey) ?? LazyPersona.defaultID
+        )
         let body: [String: Any] = [
             "text": text,
             "model_id": "eleven_flash_v2_5",
             "voice_settings": [
-                "stability": 0.5,
-                "similarity_boost": 0.75
+                "stability": persona.elevenLabsStability,
+                "similarity_boost": persona.elevenLabsSimilarity
             ]
         ]
 

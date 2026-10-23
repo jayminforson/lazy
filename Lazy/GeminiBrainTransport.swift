@@ -15,10 +15,11 @@ import Foundation
 ///   1. `~/Library/Application Support/com.yourcompany.leanring-buddy/gemini-api-key`
 ///   2. UserDefaults `clickyGeminiAPIKey`
 ///
-/// On 429 the transport demotes the smart model to the fast model once and
-/// retries before giving up to the next chain link; M7 adds one same-model
-/// retry on transient server failures (500/502/503/504/529) so a Google
-/// blip can't silently hand the turn to a fallback brain.
+/// On 429 the transport walks down one rung at a time — smart → fast (M1)
+/// → lite (M7.3) — each model tried once before the link yields, and M7
+/// adds one same-model retry on transient server failures
+/// (500/502/503/504/529) so a Google blip can't silently hand the turn to
+/// a fallback brain.
 @MainActor
 final class GeminiBrainTransport {
 
@@ -49,6 +50,16 @@ final class GeminiBrainTransport {
     /// M7; a demoted turn still gets a generation-newer brain than before).
     private static let fallbackModelID = "gemini-3.6-flash"
 
+    /// M7.3 — the last rung below the fallback: the retired fast-tier model,
+    /// kept ONLY as a 429 rescue. Evidence (2026-10-22 evening): the free
+    /// tier fully drained 3.6's bucket ("You exceeded your current quota",
+    /// 429 on every call) while lite answered 200 in 4.3 s — and a fast-tier
+    /// 429 previously failed the WHOLE Gemini link to the serve fallback
+    /// (a different, weaker brain answering slowly and unannounced, often
+    /// after the 20 s still-thinking wait). lite stays probe-gated by the
+    /// 429 itself: it is tried only when everything better is refused.
+    private static let liteRescueModelID = "gemini-3.5-flash-lite"
+
     /// Per-request timeout. Multi-monitor screenshots are large and the
     /// smart model can reason for a while before its first delta.
     /// Per-pass idle timeout (M4.5d: was 180 — a wedged free-tier stream
@@ -57,8 +68,35 @@ final class GeminiBrainTransport {
     /// stall. The turn watchdog below caps the whole turn regardless).
     private static let requestTimeoutInSeconds: TimeInterval = 60
 
-    /// UserDefaults key holding the persisted text-only conversation history.
+    /// M8 — BASE key for persisted brain history: one suffixed key per
+    /// conversation (`<base>.<uuid>`). The un-suffixed legacy blob (the
+    /// pre-M8 single global history) is read once by the migration in
+    /// +Conversations and then removed.
     private static let historyUserDefaultsKey = "geminiBrainConversationHistory"
+
+    /// One conversation's brain-history defaults key. Internal (not
+    /// private): +Conversations migrates, stores and deletes the same
+    /// storage (M2 access rule).
+    static func historyKey(for conversationID: UUID) -> String {
+        historyUserDefaultsKey + "." + conversationID.uuidString
+    }
+
+    /// Migration support: the legacy shared blob, read WITHOUT removing it.
+    static func legacyHistoryData() -> Data? {
+        UserDefaults.standard.data(forKey: historyUserDefaultsKey)
+    }
+
+    static func removeLegacyHistoryData() {
+        UserDefaults.standard.removeObject(forKey: historyUserDefaultsKey)
+    }
+
+    static func storeHistoryData(_ data: Data, for conversationID: UUID) {
+        UserDefaults.standard.set(data, forKey: historyKey(for: conversationID))
+    }
+
+    static func deleteBrainHistory(for conversationID: UUID) {
+        UserDefaults.standard.removeObject(forKey: historyKey(for: conversationID))
+    }
 
     /// Cap on persisted messages (user + assistant turns, always stored in
     /// pairs). Oldest pairs drop off first so prefill stays bounded forever.
@@ -98,6 +136,10 @@ final class GeminiBrainTransport {
     /// are never re-sent — every turn carries a fresh capture anyway).
     private var conversationHistoryMessages: [ConversationHistoryMessage]
 
+    /// M8 — the defaults key the history above persists to; nil = no
+    /// conversation active (fresh chat: empty memory, nothing written).
+    private var historyStorageKey: String?
+
     private struct ConversationHistoryMessage: Codable {
         let role: String
         let content: String
@@ -136,7 +178,10 @@ final class GeminiBrainTransport {
 
     init() {
         apiKey = Self.loadAPIKey()
-        conversationHistoryMessages = Self.loadPersistedHistory()
+        // M8 — no history at launch: the sheet opens on a fresh chat and
+        // activateBrainHistory(for:) loads a conversation's memory when it
+        // is opened or created by its first turn.
+        conversationHistoryMessages = []
 
         if apiKey.isEmpty {
             print("🧠 Gemini direct: disabled (no API key) — chain starts at local bridge")
@@ -320,15 +365,25 @@ final class GeminiBrainTransport {
                     messages: passMessages,
                     sentenceStreamer: sentenceStreamer
                 )
-            } catch let transportError as TransportError where transportError.shouldDemoteModel && passModelID != Self.fallbackModelID {
+            } catch let transportError as TransportError where transportError.shouldDemoteModel {
                 // Rate limit fires before any content delta streams (no
-                // partial speech to unwind) — demote and retry once.
-                print("⚠️ Gemini direct: \(passModelID) rate-limited — demoting to \(Self.fallbackModelID)")
-                BrainLog.line("pass: \(passModelID) rate-limited (429) — retrying on \(Self.fallbackModelID)")
-                LazyAnalytics.trackResponseError(error: "gemini-demote: \(passModelID) 429")
-                isRunningOnFallbackModel = true
+                // partial speech to unwind) — walk down one rung at a time,
+                // each model tried once: smart → fast (M1, recursion lands
+                // on the fast rung below) → lite (M7.3 rescue). A 429 on
+                // lite is not caught here — that rethrows and the link
+                // yields, same as before the rescue existed.
+                if passModelID != Self.fallbackModelID {
+                    print("⚠️ Gemini direct: \(passModelID) rate-limited — demoting to \(Self.fallbackModelID)")
+                    BrainLog.line("pass: \(passModelID) rate-limited (429) — retrying on \(Self.fallbackModelID)")
+                    LazyAnalytics.trackResponseError(error: "gemini-demote: \(passModelID) 429")
+                    isRunningOnFallbackModel = true
+                    return try await runPass(passMessages)
+                }
+                print("⚠️ Gemini direct: \(Self.fallbackModelID) rate-limited — lite rescue on \(Self.liteRescueModelID)")
+                BrainLog.line("pass: \(Self.fallbackModelID) rate-limited (429) — lite rescue on \(Self.liteRescueModelID)")
+                LazyAnalytics.trackResponseError(error: "gemini-lite-rescue: \(passModelID) 429")
                 return try await streamCompletion(
-                    modelID: Self.fallbackModelID,
+                    modelID: Self.liteRescueModelID,
                     messages: passMessages,
                     sentenceStreamer: sentenceStreamer
                 )
@@ -731,12 +786,17 @@ final class GeminiBrainTransport {
     }
 
     private func persistHistory() {
+        // M8 — no storage key = fresh chat: keep this turn's memory in place
+        // but persist nothing — a fresh chat must never resurrect old
+        // context. (Turns always run with a key: conversations are created
+        // before their first turn — defensive guard only.)
+        guard let historyStorageKey else { return }
         guard let encodedHistory = try? JSONEncoder().encode(conversationHistoryMessages) else { return }
-        UserDefaults.standard.set(encodedHistory, forKey: Self.historyUserDefaultsKey)
+        UserDefaults.standard.set(encodedHistory, forKey: historyStorageKey)
     }
 
-    private static func loadPersistedHistory() -> [ConversationHistoryMessage] {
-        guard let encodedHistory = UserDefaults.standard.data(forKey: historyUserDefaultsKey),
+    private static func loadPersistedHistory(forKey key: String) -> [ConversationHistoryMessage] {
+        guard let encodedHistory = UserDefaults.standard.data(forKey: key),
               var decodedHistory = try? JSONDecoder().decode([ConversationHistoryMessage].self, from: encodedHistory) else {
             return []
         }
@@ -751,6 +811,21 @@ final class GeminiBrainTransport {
             decodedHistory.removeFirst(2)
         }
         return decodedHistory
+    }
+
+    /// M8 — swaps the in-memory brain history between conversations. nil =
+    /// fresh chat: empty context, no storage key. The caller creates a
+    /// conversation before its first turn, so rememberExchange always finds
+    /// a live key once a turn is running.
+    func activateBrainHistory(for conversationID: UUID?) {
+        guard let conversationID else {
+            historyStorageKey = nil
+            conversationHistoryMessages = []
+            return
+        }
+        let key = Self.historyKey(for: conversationID)
+        historyStorageKey = key
+        conversationHistoryMessages = Self.loadPersistedHistory(forKey: key)
     }
 
     // MARK: - Key loading

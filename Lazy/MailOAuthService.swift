@@ -306,7 +306,20 @@ enum MailOAuthService {
     /// Returns valid tokens, transparently refreshing when the access token
     /// expires within 60 s. Nil = refresh failed → reconnect needed.
     static func validTokens(for provider: MailProvider) async -> OAuthTokens? {
-        guard let tokens = storedTokens(for: provider) else { return nil }
+        // M7.3 — the Keychain read runs OFF the main thread: SecItem's
+        // decrypt blocked main for 3–4.1 s per episode (brain.log stall
+        // dumps 2026-10-22 — frames 19–22 name this exact chain). The
+        // raw dictionary crosses back; parsing stays on the caller's actor.
+        // service/account are hoisted OUT of the @Sendable closure: they're
+        // MainActor-isolated members under default isolation, and reading
+        // them inside the detached closure makes the compiler demand an
+        // await there (probed — the hoisted form is warning-clean).
+        let service = KeychainStore.mailService
+        let account = provider.keychainAccount
+        let dictionary = await Task.detached {
+            KeychainStore.loadJSON(service: service, account: account)
+        }.value
+        guard let dictionary, let tokens = OAuthTokens(dictionary: dictionary) else { return nil }
         if tokens.expiresAt.timeIntervalSinceNow > 60 {
             return tokens
         }
@@ -314,8 +327,18 @@ enum MailOAuthService {
     }
 
     static func refresh(_ provider: MailProvider) async -> OAuthTokens? {
+        // M7.3 — same off-main Keychain read as validTokens (calling the
+        // MainActor `storedTokens` inside the detached task would hop
+        // straight back to main — the load must use the nonisolated
+        // Keychain primitive, with parsing on this side).
+        let service = KeychainStore.mailService
+        let account = provider.keychainAccount
+        let currentDictionary = await Task.detached {
+            KeychainStore.loadJSON(service: service, account: account)
+        }.value
         guard let config = MailOAuthClients.config(for: provider),
-              let current = storedTokens(for: provider),
+              let currentDictionary,
+              let current = OAuthTokens(dictionary: currentDictionary),
               !current.refreshToken.isEmpty,
               let tokenURL = tokenURL(for: provider)
         else {

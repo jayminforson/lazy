@@ -308,6 +308,13 @@ extension CompanionManager {
             "standings", "headlines", "exchange rate", "stock", "fixture",
             "2026", "2025"
         ]
+        // M7.1 — Juno is the researcher persona: she searches on the BROAD
+        // nudge cues too (that's her identity), everyone else keeps the
+        // high-precision gate (latency lesson, M4.5b). Reads the persona
+        // from defaults so both call sites (chat + transport) stay untouched.
+        if UserDefaults.standard.string(forKey: CompanionManager.activePersonaDefaultsKey) == LazyPersona.junoID {
+            return needsCurrentInformation(text) || preciseCues.contains { loweredText.contains($0) }
+        }
         return preciseCues.contains { loweredText.contains($0) }
     }
 

@@ -17,8 +17,15 @@ enum KeychainStore {
     /// "outlook:tokens").
     static let mailService = "com.yourcompany.leanring-buddy.mail"
 
+    // M7.3 — every primitive is `nonisolated`: SecItem* is thread-safe by
+    // contract and these wrappers touch nothing isolated. The stall dumps
+    // in brain.log (2026-10-22 morning, 3–4.1 s each, frames 19–22) pinned
+    // a SYNCHRONOUS Keychain decrypt running on the main actor via the
+    // mail token check — callers can now hop off-main (MailOAuthService
+    // validTokens/refresh do).
+
     @discardableResult
-    static func save(service: String, account: String, data: Data) -> Bool {
+    nonisolated static func save(service: String, account: String, data: Data) -> Bool {
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -40,7 +47,7 @@ enum KeychainStore {
         return status == errSecSuccess
     }
 
-    static func load(service: String, account: String) -> Data? {
+    nonisolated static func load(service: String, account: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -54,7 +61,7 @@ enum KeychainStore {
         return data
     }
 
-    static func delete(service: String, account: String) {
+    nonisolated static func delete(service: String, account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -69,12 +76,12 @@ enum KeychainStore {
     // MARK: - JSON convenience (token blobs are JSON dicts)
 
     @discardableResult
-    static func saveJSON(service: String, account: String, object: [String: Any]) -> Bool {
+    nonisolated static func saveJSON(service: String, account: String, object: [String: Any]) -> Bool {
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
         return save(service: service, account: account, data: data)
     }
 
-    static func loadJSON(service: String, account: String) -> [String: Any]? {
+    nonisolated static func loadJSON(service: String, account: String) -> [String: Any]? {
         guard let data = load(service: service, account: account) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }

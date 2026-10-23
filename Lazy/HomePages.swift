@@ -111,6 +111,14 @@ struct HomeCompanionsPage: View {
                         Text(companionManager.activePersona.quip)
                             .font(.system(size: 13))
                             .foregroundColor(DS.Colors.textSecondary)
+                        // M7.1 — Pip's tier lock is a behavior change; say it
+                        // out loud on the card so Smart-vs-fast is never a
+                        // mystery ("why did Pip answer like the fast model?").
+                        if companionManager.activePersona.id == LazyPersona.pipID {
+                            Text("runs fast by design")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(DS.Colors.textSecondary.opacity(0.8))
+                        }
                         HStack(spacing: 6) {
                             Circle()
                                 .fill(statusChipColor)
