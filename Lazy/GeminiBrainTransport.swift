@@ -60,6 +60,46 @@ final class GeminiBrainTransport {
     /// 429 itself: it is tried only when everything better is refused.
     private static let liteRescueModelID = "gemini-3.5-flash-lite"
 
+    // MARK: - M11 429 drain memory
+
+    /// A drained free tier429s on EVERY turn, and before M11 each turn
+    /// re-probed the dead rung and paid its 3–6 s round-trip for nothing
+    /// (evidence 2026-10-23 15:38–16:02: every single turn429'd on
+    /// gemini-3.6-flash, then fell to lite — 10–53 s turns). A model that
+    ///429s now cools down (base 3 min, doubling per consecutive strike to a
+    /// 30 min cap), so later turns skip straight to a live rung — or yield
+    /// instantly when every rung is drained instead of burning the whole
+    /// ladder. A success clears the model's state, so a recovered tier is
+    /// re-tried as soon as its window lapses.
+    private static var rateLimitCooldownUntilUptime: [String: Double] = [:]
+    private static var rateLimitStrikes: [String: Int] = [:]
+    private static let rateLimitCooldownBaseSeconds: Double = 180
+    private static let rateLimitCooldownCapSeconds: Double = 1800
+
+    /// True while a model is still cooling down from an earlier 429.
+    private static func isModelCoolingDown(_ modelID: String) -> Bool {
+        guard let untilUptime = rateLimitCooldownUntilUptime[modelID] else { return false }
+        return ProcessInfo.processInfo.systemUptime < untilUptime
+    }
+
+    /// A 429 arms (or extends) the model's cooldown with exponential backoff.
+    private static func noteRateLimit(_ modelID: String) {
+        let strikes = (rateLimitStrikes[modelID] ?? 0) + 1
+        rateLimitStrikes[modelID] = strikes
+        let cooldownSeconds = min(
+            rateLimitCooldownBaseSeconds * pow(2.0, Double(strikes - 1)),
+            rateLimitCooldownCapSeconds
+        )
+        rateLimitCooldownUntilUptime[modelID] = ProcessInfo.processInfo.systemUptime + cooldownSeconds
+        BrainLog.line("pass: \(modelID) cooling down \(Int(cooldownSeconds))s after 429 #\(strikes)")
+    }
+
+    /// A successful pass proves the tier recovered — forget its drain state.
+    private static func noteRateLimitCleared(_ modelID: String) {
+        rateLimitStrikes[modelID] = 0
+        rateLimitCooldownUntilUptime[modelID] = nil
+    }
+
     /// Per-request timeout. Multi-monitor screenshots are large and the
     /// smart model can reason for a while before its first delta.
     /// Per-pass idle timeout (M4.5d: was 180 — a wedged free-tier stream
@@ -357,37 +397,61 @@ final class GeminiBrainTransport {
         // rounds below reuse it instead of getting their own).
         var isRunningOnFallbackModel = false
 
+        // M11 — the rung ladder is now cooldown-aware and walks as a loop:
+        // smart → fast (M1) → lite (M7.3). A rung whose model is cooling down
+        // from an earlier 429 is skipped without a request, so a drained
+        // tier no longer taxes every turn with a doomed probe's round-trip.
         func runPass(_ passMessages: [[String: Any]]) async throws -> String {
-            let passModelID = isRunningOnFallbackModel ? Self.fallbackModelID : primaryModelID
-            do {
-                return try await streamCompletion(
-                    modelID: passModelID,
-                    messages: passMessages,
-                    sentenceStreamer: sentenceStreamer
-                )
-            } catch let transportError as TransportError where transportError.shouldDemoteModel {
-                // Rate limit fires before any content delta streams (no
-                // partial speech to unwind) — walk down one rung at a time,
-                // each model tried once: smart → fast (M1, recursion lands
-                // on the fast rung below) → lite (M7.3 rescue). A 429 on
-                // lite is not caught here — that rethrows and the link
-                // yields, same as before the rescue existed.
-                if passModelID != Self.fallbackModelID {
-                    print("⚠️ Gemini direct: \(passModelID) rate-limited — demoting to \(Self.fallbackModelID)")
-                    BrainLog.line("pass: \(passModelID) rate-limited (429) — retrying on \(Self.fallbackModelID)")
-                    LazyAnalytics.trackResponseError(error: "gemini-demote: \(passModelID) 429")
-                    isRunningOnFallbackModel = true
-                    return try await runPass(passMessages)
+            let rungs = [primaryModelID, Self.fallbackModelID, Self.liteRescueModelID]
+                .reduce(into: [String]()) { accumulated, modelID in
+                    if !accumulated.contains(modelID) { accumulated.append(modelID) }
                 }
-                print("⚠️ Gemini direct: \(Self.fallbackModelID) rate-limited — lite rescue on \(Self.liteRescueModelID)")
-                BrainLog.line("pass: \(Self.fallbackModelID) rate-limited (429) — lite rescue on \(Self.liteRescueModelID)")
-                LazyAnalytics.trackResponseError(error: "gemini-lite-rescue: \(passModelID) 429")
-                return try await streamCompletion(
-                    modelID: Self.liteRescueModelID,
-                    messages: passMessages,
-                    sentenceStreamer: sentenceStreamer
-                )
+            let startIndex = isRunningOnFallbackModel
+                ? (rungs.firstIndex(of: Self.fallbackModelID) ?? 0)
+                : 0
+            var lastRateLimitError: TransportError?
+
+            for rungIndex in startIndex..<rungs.count {
+                let passModelID = rungs[rungIndex]
+                let nextRungID = rungIndex + 1 < rungs.count ? rungs[rungIndex + 1] : nil
+                if Self.isModelCoolingDown(passModelID) {
+                    BrainLog.line("pass: skipping \(passModelID) — cooling down after an earlier 429")
+                    continue
+                }
+                do {
+                    let passText = try await streamCompletion(
+                        modelID: passModelID,
+                        messages: passMessages,
+                        sentenceStreamer: sentenceStreamer
+                    )
+                    Self.noteRateLimitCleared(passModelID)
+                    if !isRunningOnFallbackModel, passModelID == Self.fallbackModelID {
+                        isRunningOnFallbackModel = true
+                    }
+                    return passText
+                } catch let transportError as TransportError where transportError.shouldDemoteModel {
+                    // Rate limit fires before any content delta streams (no
+                    // partial speech to unwind) — record the cooldown and try
+                    // the next rung down. A 429 on lite (or on every rung)
+                    // rethrows at the end and the link yields, same as before.
+                    Self.noteRateLimit(passModelID)
+                    LazyAnalytics.trackResponseError(error: "gemini-429: \(passModelID)")
+                    if let nextRungID {
+                        print("⚠️ Gemini direct: \(passModelID) rate-limited — demoting to \(nextRungID)")
+                        BrainLog.line("pass: \(passModelID) rate-limited (429) — retrying on \(nextRungID)")
+                    } else {
+                        print("⚠️ Gemini direct: \(passModelID) rate-limited — no rung left")
+                        BrainLog.line("pass: \(passModelID) rate-limited (429) — no rung left")
+                    }
+                    lastRateLimitError = transportError
+                }
             }
+
+            // Every rung either cooled down (no request even made) or refused
+            // — yield as a rate limit so the chain falls through to serve /
+            // worker / Ollama instead of hanging. Cooldown-only exhaustion is
+            // instant (0 ms) instead of paying the whole drained ladder.
+            throw lastRateLimitError ?? .rateLimited
         }
 
         // Freshness fallback: a strict [SEARCH: ...] reply means the model still

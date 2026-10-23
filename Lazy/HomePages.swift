@@ -845,6 +845,10 @@ struct HomeSettingsPage: View {
     @State private var launchAtLogin = false
     @State private var launchAtLoginError: String?
     @State private var outlookSetupExpanded = false
+    // M9 — offline brain status: probed once when the page appears (a
+    // localhost /api/tags round trip; instant connection-refused when the
+    // Ollama server isn't running).
+    @State private var offlineBrainStatusLine = "checking…"
 
     private var voiceEngineLine: String {
         let lockedDate = UserDefaults.standard.string(forKey: "clickyTTSQuotaExhaustedDate")
@@ -904,6 +908,30 @@ struct HomeSettingsPage: View {
                         Text(voiceEngineLine)
                             .font(.system(size: 12))
                             .foregroundColor(DS.Colors.textTertiary)
+                    }
+
+                    Divider()
+                        .overlay(Color.white.opacity(0.06))
+
+                    // M9 — the local brain that answers when the internet is
+                    // down (or every cloud link failed). Local + free; model
+                    // overridable via the clickyOllamaModel defaults key.
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Offline brain")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(DS.Colors.textPrimary)
+                        Text(offlineBrainStatusLine)
+                            .font(.system(size: 12))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                    .task {
+                        let configuredModel = UserDefaults.standard.string(
+                            forKey: OllamaBrainTransport.modelDefaultsKey
+                        ) ?? OllamaBrainTransport.defaultModelID
+                        let reachable = await companionManager.ollamaBrainTransport.isReachable()
+                        offlineBrainStatusLine = reachable
+                            ? "\(configuredModel) · ready"
+                            : "\(configuredModel) · not running"
                     }
 
                     Divider()

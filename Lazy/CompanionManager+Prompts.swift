@@ -293,6 +293,14 @@ extension CompanionManager {
     /// kickoff/departure/fixture time is always live data. "schedule" is
     /// deliberately absent: "what's my schedule" is about their calendar.
     static func warrantsProactiveSearch(_ text: String) -> Bool {
+        // M11 — a real "look this up" question is short; a long body that
+        // merely CONTAINS a cue word is a scenario/assignment prompt, and
+        // searching it burns the whole 5–6 s budget on garbage (2026-10-23:
+        // a quiz scenario containing "current" ran a search whose query was
+        // the scenario text itself — "Byteware Solutions is a small tech
+        // startup…"). The model-driven marker path stays as the fallback if
+        // the web is genuinely needed, so nothing is lost by standing down.
+        guard text.count <= 350 else { return false }
         let loweredText = text.lowercased()
         let preciseCues = [
             "latest", "current", "right now",

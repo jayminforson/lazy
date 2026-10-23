@@ -17,7 +17,11 @@ import CoreGraphics
 import Foundation
 
 /// One numbered, pressable AX element for the current GUI step.
-struct IndexedAXElement {
+/// @unchecked Sendable: the stored AXUIElement is a CF object whose message
+/// calls are thread-safe (each is an independent IPC); M10.b runs the walk
+/// and presses off the main actor so a busy target app can never freeze the
+/// UI — refs are only transported across, never shared mutably.
+struct IndexedAXElement: @unchecked Sendable {
     /// 1-based reading-order number — the n in [GUI_CLICK_EL:n].
     let index: Int
     /// The live AX element reference (valid only for this step's app state).
@@ -34,36 +38,120 @@ enum AXElementIndexer {
 
     // MARK: - Caps
 
+    // All constants below are nonisolated: the walk runs off the main
+    // actor (M10.b) and reads these — plain Sendable values, no isolation.
+
     /// Badges burned onto one screenshot — beyond this the model falls back
     /// to coordinates rather than drowning in numbers.
-    static let maximumIndexedElementCount = 40
+    nonisolated static let maximumIndexedElementCount = 40
     /// AX walk budget per step (bounded so a pathological tree can't stall
     /// the run loop).
-    static let maximumVisitedElementCount = 500
-    static let maximumTreeDepth = 8
+    nonisolated static let maximumVisitedElementCount = 500
+    nonisolated static let maximumTreeDepth = 8
 
     /// Roles accepted as click targets even when AX reports no AXPress
     /// action (text-ish controls focus via press in most apps).
-    private static let fieldRoles: Set<String> = [
+    private nonisolated static let fieldRoles: Set<String> = [
         "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSlider"
     ]
 
     // MARK: - Enumeration
 
+    /// AX IPC budget: any single AX message to a busy/wedged target app is
+    /// cut off after this many seconds (M10.b — the 2026-10-23 drill froze
+    /// the whole app for ~16 s inside one blocked AXUIElementCopyAttributeValue
+    /// call on the main thread; the stall dump named it exactly).
+    nonisolated static let messagingTimeoutSeconds: Float = 2.0
+    /// Whole-walk wall-clock budget checked between visits: bounds a
+    /// pathological tree (many timing-out calls) to ~this long, then the
+    /// walk returns what it has — the run falls back to coordinate clicks.
+    nonisolated static let walkDeadlineSeconds: TimeInterval = 3.5
+
     /// Numbers the frontmost app's pressable elements whose centers fall on
     /// the captured cursor screen, in reading order (top rows first, left to
     /// right). Returns [] when AX is unavailable or the frontmost app is
     /// Clicky itself — callers keep the coordinate path.
-    static func indexElements(capture: CompanionScreenCapture) -> [IndexedAXElement] {
+    ///
+    /// M10.b: runs OFF the main actor via a detached task — a busy target
+    /// app can no longer freeze the UI mid-run (healthy apps: the same
+    /// 10–100 ms walk, one task hop). Per-call timeout + walk deadline cap
+    /// the worst case; on timeout the walk just returns fewer badges.
+    static func indexElements(capture: CompanionScreenCapture) async -> [IndexedAXElement] {
+        await Task.detached(priority: .userInitiated) {
+            performIndexWalk(capture: capture)
+        }.value
+    }
+
+    // MARK: - M11 pointing snap
+
+    /// Snap a model-guessed point (CG top-left global) to the real AX element
+    /// it sits on, or the nearest small control just off its edge. Run clicks
+    /// are AX-grounded, but chat [POINT:...] trusted the vision model's raw
+    /// pixel estimate — imprecise enough to land on the wrong element, which
+    /// is why pointing was the inaccurate one. Fail-open: nil when nothing
+    /// real is near, so callers keep the model's coordinate exactly as before
+    /// (this can only sharpen a point, never replace a working one). The walk
+    /// is off-main and bounded via `indexElements` (M10.b): healthy apps
+    /// cost one 10–100 ms hop, and this runs after the reply has spoken.
+    static func snapToElement(near cgPoint: CGPoint,
+                              capture: CompanionScreenCapture) async -> CGPoint? {
+        let elements = await indexElements(capture: capture)
+        guard !elements.isEmpty else { return nil }
+
+        let screenArea = capture.displayFrame.width * capture.displayFrame.height
+        // Never snap to a window/panel's middle — pointing at the center of a
+        // big container is worse than the model's own coordinate.
+        let sizeCap = screenArea * 0.4
+        /// Nearest-control tolerance: only corrects a point that fell just off
+        /// an element's edge, never leaps across a gap to a different one.
+        let nearestTolerance: CGFloat = 35
+
+        func area(of element: IndexedAXElement) -> CGFloat {
+            element.cgFrame.width * element.cgFrame.height
+        }
+        func distanceToFrame(of element: IndexedAXElement) -> CGFloat {
+            let frame = element.cgFrame
+            let deltaX = max(frame.minX - cgPoint.x, 0, cgPoint.x - frame.maxX)
+            let deltaY = max(frame.minY - cgPoint.y, 0, cgPoint.y - frame.maxY)
+            return hypot(deltaX, deltaY)
+        }
+
+        // Pass A — the smallest element containing the point (the specific
+        // control the model meant), as long as it isn't window-sized.
+        let containing = elements.filter {
+            $0.cgFrame.insetBy(dx: -6, dy: -6).contains(cgPoint) && area(of: $0) <= sizeCap
+        }
+        if let best = containing.min(by: { area(of: $0) < area(of: $1) }) {
+            return CGPoint(x: best.cgFrame.midX, y: best.cgFrame.midY)
+        }
+
+        // Pass B — nearest small control within tolerance (the point fell
+        // just off the edge / into the gap beside the element it aimed at).
+        let smallControls = elements.filter { area(of: $0) <= sizeCap }
+        guard let nearest = smallControls.min(by: { distanceToFrame(of: $0) < distanceToFrame(of: $1) }),
+              distanceToFrame(of: nearest) <= nearestTolerance else {
+            return nil
+        }
+        return CGPoint(x: nearest.cgFrame.midX, y: nearest.cgFrame.midY)
+    }
+
+    /// The walk itself — nonisolated: pure AX IPC + CoreGraphics reads, no
+    /// main-actor state. Called only from `indexElements`'s detached task.
+    nonisolated static func performIndexWalk(capture: CompanionScreenCapture) -> [IndexedAXElement] {
+        let walkStartDate = Date()
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
               frontmostApp.bundleIdentifier != Bundle.main.bundleIdentifier else {
             return []
         }
         let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
+        // Caps EVERY AX message to this app while the target is busy — a
+        // wedged app costs ≤2 s per call instead of blocking indefinitely.
+        AXUIElementSetMessagingTimeout(appElement, messagingTimeoutSeconds)
 
         var candidates: [(element: AXUIElement, role: String, title: String, frame: CGRect)] = []
         var visitedCount = 0
-        collectPressable(appElement, depth: 0, visitedCount: &visitedCount, into: &candidates)
+        let walkDeadline = walkStartDate.addingTimeInterval(walkDeadlineSeconds)
+        collectPressable(appElement, depth: 0, visitedCount: &visitedCount, deadline: walkDeadline, into: &candidates)
 
         let mainDisplayHeight = CGFloat(CGDisplayBounds(CGMainDisplayID()).height)
         let screenCGRect = CGRect(
@@ -95,19 +183,28 @@ enum AXElementIndexer {
                 cgFrame: candidate.frame
             )
         }
+        let walkElapsed = Date().timeIntervalSince(walkStartDate)
         if !indexed.isEmpty {
-            print("🧩 AX index: \(indexed.count) element(s) in \(capture.label) (visited \(visitedCount))")
+            print("🧩 AX index: \(indexed.count) element(s) in \(capture.label) (visited \(visitedCount), \(String(format: "%.0f", walkElapsed * 1000))ms)")
+        } else if walkElapsed >= walkDeadlineSeconds * 0.8 || visitedCount >= maximumVisitedElementCount {
+            // Evidence line: the walk was cut short — badges missing on this
+            // step is expected, a UI freeze is not (the walk is off-main now).
+            BrainLog.line("ax: walk degraded in \(capture.label) — visited \(visitedCount), \(String(format: "%.2f", walkElapsed))s (busy app; badges may be incomplete)")
         }
         return indexed
     }
 
-    private static func collectPressable(
+    nonisolated private static func collectPressable(
         _ element: AXUIElement,
         depth: Int,
         visitedCount: inout Int,
+        deadline: Date,
         into candidates: inout [(element: AXUIElement, role: String, title: String, frame: CGRect)]
     ) {
         guard depth <= maximumTreeDepth, visitedCount < maximumVisitedElementCount else { return }
+        // Wall-clock bail: a wedged app timing out per call would otherwise
+        // stretch the walk to visits × timeout; stop and keep what we have.
+        guard Date() <= deadline else { return }
         visitedCount += 1
 
         if let candidate = pressableCandidate(from: element) {
@@ -116,11 +213,11 @@ enum AXElementIndexer {
 
         guard let children = copyAttribute(kAXChildrenAttribute, from: element) as? [AXUIElement] else { return }
         for child in children {
-            collectPressable(child, depth: depth + 1, visitedCount: &visitedCount, into: &candidates)
+            collectPressable(child, depth: depth + 1, visitedCount: &visitedCount, deadline: deadline, into: &candidates)
         }
     }
 
-    private static func pressableCandidate(
+    nonisolated private static func pressableCandidate(
         from element: AXUIElement
     ) -> (element: AXUIElement, role: String, title: String, frame: CGRect)? {
         guard let role = stringAttribute(kAXRoleAttribute, from: element) else { return nil }
@@ -138,30 +235,31 @@ enum AXElementIndexer {
         return (element, role, title, frame)
     }
 
-    // MARK: - AX attribute helpers
+    // MARK: - AX attribute helpers (nonisolated: pure AX IPC, callable from
+    // the detached walk; each call is bounded by the app-element timeout)
 
-    private static func copyAttribute(_ attribute: String, from element: AXUIElement) -> CFTypeRef? {
+    nonisolated private static func copyAttribute(_ attribute: String, from element: AXUIElement) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
         return value
     }
 
-    private static func stringAttribute(_ attribute: String, from element: AXUIElement) -> String? {
+    nonisolated private static func stringAttribute(_ attribute: String, from element: AXUIElement) -> String? {
         copyAttribute(attribute, from: element) as? String
     }
 
-    private static func boolAttribute(_ attribute: String, from element: AXUIElement) -> Bool? {
+    nonisolated private static func boolAttribute(_ attribute: String, from element: AXUIElement) -> Bool? {
         copyAttribute(attribute, from: element) as? Bool
     }
 
-    private static func copyActionNames(of element: AXUIElement) -> [String] {
+    nonisolated private static func copyActionNames(of element: AXUIElement) -> [String] {
         var names: CFArray?
         guard AXUIElementCopyActionNames(element, &names) == .success,
               let names else { return [] }
         return (names as? [String]) ?? []
     }
 
-    private static func frame(of element: AXUIElement) -> CGRect? {
+    nonisolated private static func frame(of element: AXUIElement) -> CGRect? {
         guard let positionValue = copyAttribute(kAXPositionAttribute, from: element),
               let sizeValue = copyAttribute(kAXSizeAttribute, from: element),
               CFGetTypeID(positionValue) == AXValueGetTypeID(),
@@ -269,8 +367,15 @@ enum AXElementIndexer {
     /// Presses the indexed element via AX — no cursor movement, so clicks
     /// land in background windows too. Returns false when the action is
     /// rejected (verification then flags the step as no-effect).
-    static func performPress(_ element: AXUIElement) -> Bool {
-        let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
-        return result == .success
+    ///
+    /// M10.b: off the main actor with the per-app messaging timeout — a
+    /// busy target app costs ≤2 s and returns false, never a UI freeze.
+    static func performPress(_ element: AXUIElement) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            // The timeout is per-app (set on any element of that app); the
+            // walk may not have run for this app, so set it here too.
+            AXUIElementSetMessagingTimeout(element, messagingTimeoutSeconds)
+            return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+        }.value
     }
 }

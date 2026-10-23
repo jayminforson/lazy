@@ -117,12 +117,25 @@ enum WebSearch {
         }
     }
 
-    /// DuckDuckGo first (cleanest parse when it works), Bing second.
+    /// Both engines at once (M11). Racing replaces the old sequential
+    /// DDG-then-Bing order because DuckDuckGo has been rate-limiting this
+    /// machine often enough (2026-10-23: "no parseable results" on every
+    /// probe) that waiting out its ~3–5 s failure before starting Bing
+    /// burned most of the 6 s budget — searches hit the hard deadline or
+    /// limped back at ~5 s. First non-empty result wins; the loser is
+    /// cancelled (URLSession honors task cancellation immediately).
     private static func runEngines(query: String) async -> [WebSearchResult]? {
-        if let results = await fetchDuckDuckGo(query), !results.isEmpty { return results }
-        if Task.isCancelled { return nil }
-        if let results = await fetchBing(query), !results.isEmpty { return results }
-        return nil
+        await withTaskGroup(of: [WebSearchResult].self) { group -> [WebSearchResult]? in
+            group.addTask { await fetchDuckDuckGo(query) ?? [] }
+            group.addTask { await fetchBing(query) ?? [] }
+            for await results in group {
+                if !results.isEmpty {
+                    group.cancelAll()
+                    return results
+                }
+            }
+            return nil
+        }
     }
 
     /// Circuit-breaker bookkeeping — a success re-opens the circuit at once.

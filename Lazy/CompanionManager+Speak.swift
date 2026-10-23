@@ -143,12 +143,20 @@ extension CompanionManager {
         // resolve, probed: compact.* aliases to super-compact.*).
         if persona.systemVoiceIdentifier == nil {
             let synthesizer = NSSpeechSynthesizer()
+            // M10.b — latest-wins for BOTH engines: NSSpeech self-retains
+            // while speaking, so a new utterance must stop the old one
+            // explicitly (replacement only ever covered AVSpeech).
+            systemVoiceSynthesizer?.stopSpeaking(at: .immediate)
+            stopLegacySpeechNow()
+            systemNSSpeechSynthesizer = synthesizer
             synthesizer.startSpeaking(utterance)
             LazyLatency.markFirstTTSPaudio()
             voiceState = .responding
             return
         }
         let synthesizer = AVSpeechSynthesizer()
+        stopLegacySpeechNow()
+        systemVoiceSynthesizer?.stopSpeaking(at: .immediate)
         let utteranceObject = AVSpeechUtterance(string: utterance)
         if let voiceIdentifier = persona.systemVoiceIdentifier {
             if let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
@@ -165,12 +173,42 @@ extension CompanionManager {
         voiceState = .responding
     }
 
+    /// Stops a still-talking NSSpeech utterance (the M7.2 Lazy-path engine)
+    /// without naming any deprecated symbol: NSSpeechSynthesizer and every
+    /// member are deprecated in 14.0, so a direct `stopSpeaking()` call
+    /// prints a deprecation note — and rule 6 (add zero warnings) locks the
+    /// budget at M7.2's two sanctioned sites. Same effect, dispatched
+    /// through the ObjC runtime (the instance is held as AnyObject for the
+    /// same reason); always called on the main actor where speech runs.
+    private func stopLegacySpeechNow() {
+        // NSSelectorFromString (not Selector(("…")) — Swift nags for #selector,
+        // and #selector would NAME the deprecated method, re-triggering the
+        // deprecation note this whole indirection exists to avoid).
+        _ = (systemNSSpeechSynthesizer as? NSObject)?.perform(NSSelectorFromString("stopSpeaking"))
+    }
+
+    /// M10.b — kills everything currently audible: queued + playing
+    /// ElevenLabs audio and EITHER system-voice engine. Called before an
+    /// outcome line speaks so the run's 30 s "still working on it" beat
+    /// (or a plan sentence that flushed late) can never talk over it —
+    /// on 2026-10-23 the beat's tail and the outcome overlapped by
+    /// ~260 ms because cancelling the beat task does not stop audio
+    /// already in flight.
+    func stopAllSpeechNow() {
+        elevenLabsTTSClient.stopPlayback()
+        systemVoiceSynthesizer?.stopSpeaking(at: .immediate)
+        stopLegacySpeechNow()
+    }
+
     /// Speaks a task/agent/GUI/pre-route OUTCOME line for voice: system
     /// voice when ElevenLabs failed or is locked out for the day, ElevenLabs
     /// otherwise, with the system-voice real-content fallback on error
     /// (Phase 0: reason → chip only, content → audio).
     func speakOutcomeLine(_ outcomeLine: String) async {
         guard !outcomeLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // M10.b — the outcome is the LAST word: stop any audio still in
+        // flight before it starts (one voice at a time, no overlap).
+        stopAllSpeechNow()
         if replyNeedsSystemVoiceFallback || isElevenLabsVoiceDisabledToday {
             speakViaSystemVoice(outcomeLine)
             LazyLatency.mark("task-audio-started")

@@ -68,6 +68,10 @@ extension CompanionManager {
         LazyLatency.mark("agent-run-started")
         let agentRunStartDate = Date()
         print("🤖 Agent run started (\(agentRunSourceLabel)): \(goal)")
+        // M10.c — run evidence: every run names itself in brain.log at start
+        // and at EVERY exit (the 2026-10-23 drill's runs died with zero
+        // trace of why — outcome failures never reached any log).
+        BrainLog.line("run: started (\(agentRunSourceLabel)) — \(String(goal.prefix(160)))")
 
         // Voice: a quiet "still working on it" beat every ~30s so a long
         // run doesn't feel wedged — typed already sees live step lines.
@@ -125,6 +129,7 @@ extension CompanionManager {
                 // the legacy per-step loop (serve runComputerUseStep does
                 // the clicking) — its outcome line is the user-facing result.
                 print("🤖 Agent run: falling back to the legacy computer-use loop (direct path unavailable)")
+                BrainLog.line("run: direct Gemini loop unavailable — legacy computer-use loop (keyless fallback)")
                 let legacyOutcomeLine = await executeComputerUseRun(goal: goal, source: source)
                 agentRunOutcome = OpenCodeChatClient.AgentRunOutcome(
                     finalSummaryText: legacyOutcomeLine,
@@ -156,12 +161,21 @@ extension CompanionManager {
             }
             LazyLatency.mark("agent-run-finished")
             print("🤖 Agent run finished: \(agentRunOutcome.toolCallCount) tool call(s), \(agentRunDurationMilliseconds)ms, stoppedEarly=\(agentRunOutcome.didStopEarly)")
+            // M10.c — one line names success OR failure; a failed run's
+            // description finally reaches evidence (before this, failures
+            // were spoken and printed to the console only).
+            if let runFailureDescription = agentRunOutcome.failureDescription {
+                BrainLog.line("run: FAILED after \(agentRunOutcome.toolCallCount) tool call(s) in \(agentRunDurationMilliseconds)ms — \(String(runFailureDescription.prefix(300)))")
+            } else {
+                BrainLog.line("run: finished — \(agentRunOutcome.toolCallCount) tool call(s) in \(agentRunDurationMilliseconds)ms, stoppedEarly=\(agentRunOutcome.didStopEarly) · \(String(agentRunOutcome.finalSummaryText.prefix(120)))")
+            }
             return agentRunOutcome
         } catch is CancellationError {
             // A new interaction interrupted the run (PTT re-press, typed
             // message, Stop button) — the client already aborted it
             // server-side so bash stopped too.
             LazyAnalytics.trackAgentRunAborted(reason: "cancelled")
+            BrainLog.line("run: cancelled after \(activeAgentRunProgressLines.count) tool call(s)")
             return OpenCodeChatClient.AgentRunOutcome(
                 finalSummaryText: "",
                 toolCallCount: activeAgentRunProgressLines.count,
@@ -173,6 +187,7 @@ extension CompanionManager {
             LazyAnalytics.trackAgentRunAborted(reason: "error")
             LazyAnalytics.trackResponseError(error: "agent: \(error.localizedDescription)")
             recordLastError("agent run failed — \(String(error.localizedDescription.prefix(160)))")
+            BrainLog.line("run: threw after \(activeAgentRunProgressLines.count) tool call(s) — \(String(error.localizedDescription.prefix(300)))")
             return OpenCodeChatClient.AgentRunOutcome(
                 finalSummaryText: "",
                 toolCallCount: activeAgentRunProgressLines.count,
@@ -273,7 +288,9 @@ extension CompanionManager {
             guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
                 return (text: "error: no screen capture", imageData: nil)
             }
-            let indexedElements = AXElementIndexer.indexElements(capture: cursorScreenCapture)
+            // M10.b: the AX walk runs off the main actor (busy target apps
+            // can no longer freeze the UI mid-run).
+            let indexedElements = await AXElementIndexer.indexElements(capture: cursorScreenCapture)
             activeStepIndexedElements = indexedElements
             activeStepScreenshotCapture = cursorScreenCapture
             let groundedImageData = AXElementIndexer.overlayBadges(
@@ -328,7 +345,7 @@ extension CompanionManager {
             guard let indexedElement = activeStepIndexedElements.first(where: { $0.index == elementIndex }) else {
                 return "error: badge \(elementIndex) is not in the latest screenshot — take a fresh screenshot first"
             }
-            let didPress = AXElementIndexer.performPress(indexedElement.element)
+            let didPress = await AXElementIndexer.performPress(indexedElement.element)
             guard didPress else {
                 return "error: AXPress on badge \(elementIndex) (\(indexedElement.role) '\(indexedElement.title)') was rejected"
             }
@@ -489,7 +506,7 @@ extension CompanionManager {
             // A1/A2 — AX grounding: number the frontmost app's pressable
             // elements that sit on this screen (reading order), burn amber
             // badges into the screenshot, and pass the badge legend along.
-            let stepIndexedElements = AXElementIndexer.indexElements(capture: cursorScreenCapture)
+            let stepIndexedElements = await AXElementIndexer.indexElements(capture: cursorScreenCapture)
             activeStepIndexedElements = stepIndexedElements
             let groundedScreenshotData = AXElementIndexer.overlayBadges(
                 on: cursorScreenCapture.imageData,
@@ -560,7 +577,7 @@ extension CompanionManager {
             completedActionHistoryLines.append(progressLineText)
             handleAgentRunProgressLine("→ \(progressLineText)", source: source)
 
-            performComputerUseAction(computerUseAction, on: cursorScreenCapture)
+            await performComputerUseAction(computerUseAction, on: cursorScreenCapture)
             LazyLatency.mark("computer-use-step-executed")
 
             // Arm A3 verification: compare this pre-action capture against
@@ -662,7 +679,9 @@ extension CompanionManager {
     /// Posts the synthetic events for one parsed action. Click coordinates
     /// use the same screenshot-pixel → AppKit-global conversion as POINT
     /// pointing; typing reuses the dictation keystroke machinery.
-    private func performComputerUseAction(_ computerUseAction: ComputerUseAction, on screenCapture: CompanionScreenCapture) {
+    // M10.b: async — the AXPress inside it runs off the main actor (a busy
+    // target app can cost ≤2 s, never a UI freeze).
+    private func performComputerUseAction(_ computerUseAction: ComputerUseAction, on screenCapture: CompanionScreenCapture) async {
         switch computerUseAction {
         case .click(let x, let y):
             let globalClickLocation = computerUseGlobalLocation(
@@ -677,7 +696,7 @@ extension CompanionManager {
                 print("🖥 Computer-use element \(elementIndex) not in this step's index (badges may be stale)")
                 return
             }
-            let didPress = AXElementIndexer.performPress(indexedElement.element)
+            let didPress = await AXElementIndexer.performPress(indexedElement.element)
             print("🖥 Computer-use AXPress element \(elementIndex) (\(indexedElement.role) '\(indexedElement.title)') → \(didPress ? "ok" : "rejected")")
         case .typeText(let text):
             postComputerUseTypedText(text)

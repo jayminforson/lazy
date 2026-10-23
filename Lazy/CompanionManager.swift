@@ -233,6 +233,13 @@ final class CompanionManager: ObservableObject {
     /// per-conversation brain history on open/create/delete (M2 access rule).
     let geminiBrainTransport = GeminiBrainTransport()
 
+    /// M9 — offline fallback brain: a LOCAL Ollama server (127.0.0.1:11434).
+    /// Rung #0 (before Gemini) when there is no network route at all — the
+    /// cloud links could only burn timeout budget — and the final rung after
+    /// the worker fails. Text-only by design (the pulled instruct models
+    /// have no vision); $0 forever, no new credential.
+    let ollamaBrainTransport = OllamaBrainTransport()
+
     lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         let client = ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
         client.onQueueFailure = { [weak self] error in
@@ -590,6 +597,11 @@ final class CompanionManager: ObservableObject {
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
+
+        // M9: cached network reachability — start the monitor now so the
+        // first turn already knows whether the cloud links are reachable
+        // (unsatisfied route → local Ollama brain, no timeout budget burned).
+        _ = NetworkStatusMonitor.shared
 
         // Warm the local OpenCode bridge (health + session checks) so the
         // first voice interaction doesn't pay for cold preflight round trips.
@@ -1001,8 +1013,10 @@ final class CompanionManager: ObservableObject {
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
         // Cancel any in-progress response and TTS from a previous utterance
+        // (M10.b: all engines — queued/playing ElevenLabs AND either system
+        // voice — one voice at a time when the new turn starts).
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        stopAllSpeechNow()
         companionResponseOverlayManager.hideOverlay()
         // A typed chat response may be streaming — abort it so the chat
         // window doesn't keep a stale in-flight bubble. The cancelled
@@ -1246,7 +1260,7 @@ final class CompanionManager: ObservableObject {
         // flight. The cancelled task skips its own cleanup (guarded by
         // `!Task.isCancelled`), so reset shared state here.
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        stopAllSpeechNow()
         companionResponseOverlayManager.hideOverlay()
         if source == .typed {
             chatIsResponding = false
@@ -1628,7 +1642,48 @@ final class CompanionManager: ObservableObject {
                 var fullResponseText = ""
                 var alreadySpokenReplyPrefix = ""
 
-                if geminiBrainTransport.isConfigured {
+                // M9 — offline fast path: no network route (or the
+                // clickyOfflineBrainOnly drill flag) means every cloud link
+                // can only burn timeout budget, so the LOCAL Ollama brain
+                // runs first. On failure the chain falls through to the
+                // cloud links anyway — a stale monitor or the drill flag
+                // (network up) still get a real answer; truly offline, the
+                // usual timeout cascade ends at the honest failure line.
+                let offlineBrainForced = UserDefaults.standard.bool(forKey: "clickyOfflineBrainOnly")
+                if offlineBrainForced || !NetworkStatusMonitor.shared.isOnline {
+                    do {
+                        let streamedReply = try await ollamaBrainTransport.analyzeScreenshots(
+                            images: labeledImages,
+                            systemPrompt: companionSystemPrompt,
+                            userPrompt: brainUserPrompt,
+                            conversationHistoryPairs: conversationHistory.map { entry in
+                                (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+                            },
+                            onSentenceReady: speakReply ? { [weak self] sentence in
+                                self?.handleEarlyReplySentence(sentence)
+                            } : nil,
+                            onDelta: { [weak self] displayText in
+                                if !hasMarkedFirstBrainDelta {
+                                    hasMarkedFirstBrainDelta = true
+                                    LazyLatency.mark("brain-first-delta")
+                                }
+                                self?.handleStreamedReplyDisplayUpdate(displayText, source: source)
+                            }
+                        )
+                        fullResponseText = streamedReply.fullReplyText
+                        alreadySpokenReplyPrefix = streamedReply.alreadySpokenReplyPrefix
+                    } catch {
+                        if Task.isCancelled { throw CancellationError() }
+                        // Drop any sentences the failed attempt already queued
+                        // so the next chain link isn't spoken on top of them.
+                        elevenLabsTTSClient.stopPlayback()
+                        print("⚠️ Ollama offline brain failed, trying cloud links: \(error)")
+                        BrainLog.line("chain: Ollama offline rung failed (\(error)) — trying cloud links anyway")
+                        LazyAnalytics.trackResponseError(error: "ollama: \(error.localizedDescription)")
+                    }
+                }
+
+                if fullResponseText.isEmpty, geminiBrainTransport.isConfigured {
                     do {
                         let streamedReply = try await geminiBrainTransport.analyzeScreenshots(
                             images: labeledImages,
@@ -1705,23 +1760,54 @@ final class CompanionManager: ObservableObject {
                         let historyForAPI = conversationHistory.map { entry in
                             (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                         }
-                        let (fallbackResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                            images: labeledImages,
-                            systemPrompt: companionSystemPrompt,
-                            conversationHistory: historyForAPI,
-                            userPrompt: brainUserPrompt,
-                            onTextChunk: { [weak self] accumulatedFallbackReplyText in
-                                if !hasMarkedFirstBrainDelta {
-                                    hasMarkedFirstBrainDelta = true
-                                    LazyLatency.mark("brain-first-delta")
+                        do {
+                            let (fallbackResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                                images: labeledImages,
+                                systemPrompt: companionSystemPrompt,
+                                conversationHistory: historyForAPI,
+                                userPrompt: brainUserPrompt,
+                                onTextChunk: { [weak self] accumulatedFallbackReplyText in
+                                    if !hasMarkedFirstBrainDelta {
+                                        hasMarkedFirstBrainDelta = true
+                                        LazyLatency.mark("brain-first-delta")
+                                    }
+                                    self?.handleStreamedReplyDisplayUpdate(
+                                        Self.displayTextWithoutPointTag(accumulatedFallbackReplyText),
+                                        source: source
+                                    )
                                 }
-                                self?.handleStreamedReplyDisplayUpdate(
-                                    Self.displayTextWithoutPointTag(accumulatedFallbackReplyText),
-                                    source: source
-                                )
-                            }
-                        )
-                        fullResponseText = fallbackResponseText
+                            )
+                            fullResponseText = fallbackResponseText
+                        } catch {
+                            if Task.isCancelled { throw CancellationError() }
+                            // M9 — final rung: every cloud link just failed
+                            // (quota drained, worker down) — the LOCAL Ollama
+                            // brain gets the last word before the honest
+                            // failure line. If it throws too, the error
+                            // propagates and the outer catch speaks.
+                            elevenLabsTTSClient.stopPlayback()
+                            print("⚠️ Worker fallback failed, trying local Ollama brain: \(error)")
+                            BrainLog.line("chain: worker failed (\(error)) — final rung: local Ollama")
+                            LazyAnalytics.trackResponseError(error: "worker: \(error.localizedDescription)")
+                            let streamedReply = try await ollamaBrainTransport.analyzeScreenshots(
+                                images: labeledImages,
+                                systemPrompt: companionSystemPrompt,
+                                userPrompt: brainUserPrompt,
+                                conversationHistoryPairs: historyForAPI,
+                                onSentenceReady: speakReply ? { [weak self] sentence in
+                                    self?.handleEarlyReplySentence(sentence)
+                                } : nil,
+                                onDelta: { [weak self] displayText in
+                                    if !hasMarkedFirstBrainDelta {
+                                        hasMarkedFirstBrainDelta = true
+                                        LazyLatency.mark("brain-first-delta")
+                                    }
+                                    self?.handleStreamedReplyDisplayUpdate(displayText, source: source)
+                                }
+                            )
+                            fullResponseText = streamedReply.fullReplyText
+                            alreadySpokenReplyPrefix = streamedReply.alreadySpokenReplyPrefix
+                        }
                     }
                 }
 
@@ -1951,7 +2037,26 @@ final class CompanionManager: ObservableObject {
                         y: appKitY + displayFrame.origin.y
                     )
 
-                    detectedElementScreenLocation = globalLocation
+                    // M11 — ground the model's pixel guess to the real AX
+                    // element under/near it (run clicks are AX-grounded, but
+                    // this path trusted raw coordinates → sometimes pointed at
+                    // the wrong thing). Fail-open to the model's coordinate.
+                    let mainDisplayHeight = CGFloat(CGDisplayBounds(CGMainDisplayID()).height)
+                    let modelCGPoint = CGPoint(x: globalLocation.x, y: mainDisplayHeight - globalLocation.y)
+                    var targetGlobalLocation = globalLocation
+                    if let snappedCGPoint = await AXElementIndexer.snapToElement(
+                        near: modelCGPoint, capture: targetScreenCapture) {
+                        targetGlobalLocation = CGPoint(
+                            x: snappedCGPoint.x,
+                            y: mainDisplayHeight - snappedCGPoint.y
+                        )
+                        BrainLog.line("point: grounded → (\(Int(targetGlobalLocation.x)), \(Int(targetGlobalLocation.y))) from model (\(Int(globalLocation.x)), \(Int(globalLocation.y))) \"\(parseResult.elementLabel ?? "element")\"")
+                        print("🎯 Point grounded to AX element: (\(Int(globalLocation.x)), \(Int(globalLocation.y))) → (\(Int(targetGlobalLocation.x)), \(Int(targetGlobalLocation.y)))")
+                    } else {
+                        BrainLog.line("point: no AX element near model (\(Int(globalLocation.x)), \(Int(globalLocation.y))) — kept model coordinate")
+                    }
+
+                    detectedElementScreenLocation = targetGlobalLocation
                     detectedElementDisplayFrame = displayFrame
                     LazyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
                     print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
@@ -2203,6 +2308,17 @@ final class CompanionManager: ObservableObject {
     /// it on a new utterance also stops the previous one (latest wins).
     /// Stored here because extensions can't add stored properties.
     var systemVoiceSynthesizer: AVSpeechSynthesizer?
+
+    /// M10.b — the NSSpeech side of `speakViaSystemVoice` (M7.2's Lazy path)
+    /// needs a handle too: NSSpeech SELF-RETAINS while speaking, so a
+    /// still-talking instance outlives the function that made it (latest-
+    /// wins only ever covered AVSpeech — a beat or an old outcome could
+    /// talk over the new line). Typed `AnyObject` deliberately: NSSpeech is
+    /// deprecated as a WHOLE in 14.0 and every direct mention of it prints
+    /// a deprecation note — the budget (rule 6, add zero) was locked at
+    /// M7.2's two sites (create + startSpeaking in +Speak), so this handle
+    /// never names the type and is stopped via `stopLegacySpeechNow()`.
+    var systemNSSpeechSynthesizer: AnyObject?
 
     // MARK: - Point Tag Parsing
 
